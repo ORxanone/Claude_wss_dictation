@@ -3,8 +3,17 @@
 > **Bu faylın məqsədi:** yeni agent session-da konteksti bərpa etmək.
 > Yeni session-da de: **"`~/voice-dictate-README.md` faylını oxu — voice-dictate layihəsinə davam edək"**
 >
-> **İki versiya var:** v1 = canlı quruluş (`~/.local/share/voice-dictate`, `Ctrl+Space`, git `main`).
-> v2 = `~/voice-dictate-v2` (git `v2` branch), v1 ilə yan-yana işləyir — bax **§10**.
+> **AKTİV VERSİYA: v2** (`~/voice-dictate-v2`, git `v2` branch, CLI `voice-dictate2`, qısayol `Ctrl+Space`) — bax **§10**.
+> **v1 SÖNDÜRÜLÜB** (2026-11-13, səbəb: təhlükəsiz olmayan token yeniləməsi, §3b). Faylları yerindədir.
+> Konfiq ehtiyat nüsxəsi: `~/voice-dictate-backup-20261113-1420/`.
+>
+> **v1-ə geri qayıtmaq** (lazım olsa):
+> ```bash
+> ~/voice-dictate-v2/uninstall.sh
+> mv ~/.local/share/dbus-1/services/org.local.VoiceDictate.service{.disabled,}
+> kwriteconfig6 --file kwinrc --group Plugins --key voicedictateEnabled true
+> systemctl --user enable --now voice-dictate voice-dictate-hotkey
+> ```
 
 ---
 
@@ -139,6 +148,8 @@ Ctrl+Space (fiziki)
 - ✅ (v2) `voice-dictate2 check-endpoint` avtomatik yoxlayır. Claude Code update olarsa endpoint dəyişə bilər → yenidən `grep -aob "speech_to_text"` ilə yoxla (bu README-dəki protokol bölməsi kömək edər)
 - ✅ (v2) `VD_SHORTCUT=... ./install.sh`. Qısayolu dəyişmək istəsə: Shortcuts-də "Voice Dictate Toggle" (KWin script qeydiyyatı) və ya main.js-də keySequence
 11. **Token yarışı** (ətraflı və son həll: §3a/§3b; aşağıdakı ilkin v2 həlli əvəz olunub): refresh_token rotasiya olunur. Eyni köhnə refresh_token-i iki proses (Claude Code, Zed claude-acp agentləri, bizim daemon) işlədərsə, biri `invalid_grant` alır → `/login` tələb oluna bilər. v2-də: lock faylı (`~/.cache/voice-dictate2.refresh.lock`), yeniləmədən əvvəl faylı yenidən oxumaq (başqası yeniləyibsə onu işlət), 401-də fayldakı token fərqlidirsə yeniləmədən onu işlət, yazanda ən təzə faylla birləşdir (mcpOAuth itməsin), uğursuzluqda fayldakı tokenə qayıt.
+13. **Səs olmayanda server mətn göndərmədən bağlanır** (CloseStream → close 1000, TranscriptEndpoint YOX). Bu xəta deyil — boş transcript kimi qəbul et (v2-də düzəldilib; əvvəl "bağlantı bağlandı" xətası çıxırdı).
+14. Qısayol köçürmə: köhnə qısayolu `qdbus6 org.kde.kglobalaccel /kglobalaccel org.kde.KGlobalAccel.unregister kwin "<ad>"` ilə azad et, yoxsa yeni script eyni düyməni ala bilmir.
 12. `~/.config/kwinrc`-dəki `voicedictateEnabled=true` girişi KWin tərəfindən silinə bilər — problem deyil, hotkey servisi hər login-də `loadScript`+`start` edir.
 
 - ⬜ **Qeyri-rəsmi istifadədir** — Anthropic ToS riski istifadəçiyə məxsusdur, şəxsi istifadə üçün
@@ -191,7 +202,10 @@ v1-in snapşotundan törəyib; v1-ə toxunmur. Quraşdırma: `cd ~/voice-dictate
 - Token yarışına qarşı qoruma — Claude Code-un öz kilid protokoluna qoşulur (§3a, §3b).
 - Servis sistem node-u (`/usr/bin/node`, ≥20) ilə işləyir — nvm versiya dəyişəndə sınmır.
 
-**Hələ real mikrofonla test olunmayıb:** səssizlik avto-dayandırma, avtomatik paste, clipboard bərpası (v2 quraşdırılmalıdır).
+**Quraşdırılıb və yoxlanılıb (2026-11-13):** servis `/usr/bin/node` ilə, KWin script, `Ctrl+Space` (ydotool simulyasiyası ilə)
+→ yazma başladı, tray ikonu `media-record`-a keçdi, 15s səssizlikdən sonra avto-dayandı, child qalmadı;
+real token ilə WS auth OK, credentials faylı dəyişmədi, kilid qalmadı; fon səs-küyü RMS ≤186 (hədd 400).
+**Hələ istifadəçi tərəfindən yoxlanmalı:** real danışıqla avtomatik paste + clipboard bərpası.
 
 **v2 test əmrləri:**
 ```bash

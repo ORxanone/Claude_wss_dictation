@@ -385,9 +385,14 @@ async function recordAndTranscribe(opts, onChunk, allowRetry = true) {
         break;
     }
   });
-  ws.on('close', () => {
+  let closeSent = false;
+  ws.on('close', (code) => {
     clearInterval(ka);
-    if (!finalized) { finalized = true; finalReject(new Error('bağlantı bağlandı')); }
+    if (finalized) return;
+    finalized = true;
+    // CloseStream-dən sonra normal bağlanma (1000) = server bitirdi; səs yox idisə mətn boşdur
+    if (closeSent && code === 1000) finalResolve(latest);
+    else finalReject(new Error(`bağlantı gözlənilmədən bağlandı (kod ${code})`));
   });
   ws.on('error', () => {});
 
@@ -435,7 +440,7 @@ async function recordAndTranscribe(opts, onChunk, allowRetry = true) {
   }
 
   // finalize: CloseStream göndər, son nəticəni gözlə
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'CloseStream' }));
+  if (ws.readyState === WebSocket.OPEN) { closeSent = true; ws.send(JSON.stringify({ type: 'CloseStream' })); }
   let transcript;
   try {
     transcript = await Promise.race([
