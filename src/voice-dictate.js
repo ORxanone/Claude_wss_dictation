@@ -257,6 +257,10 @@ async function recordAndTranscribe(opts, onChunk, allowRetry = true) {
 // ---------- paste ----------
 // Daemon systemd-də qalxanda WAYLAND_DISPLAY olmaya bilər (Plazma sonra set edir).
 // XDG_RUNTIME_DIR-də wayland-* socket-i axtarıb env-i tamamlayırıq.
+const PASTE_LOG = path.join(os.homedir(), '.cache', 'voice-dictate-paste.log');
+function pasteLog(msg) {
+  try { fs.appendFileSync(PASTE_LOG, new Date().toISOString() + ' ' + msg + '\n'); } catch {}
+}
 function waylandEnv() {
   const env = { ...process.env };
   if (!env.WAYLAND_DISPLAY && env.XDG_RUNTIME_DIR) {
@@ -288,9 +292,14 @@ async function pasteText(text) {
   // ydotool type US keymap-dan kənar simvolları ATIR, ona görə paste birinci yoldur.
   const pasted = await new Promise((resolve) => {
     const y = spawn('ydotool', ['key', '--key-delay', '60', '29:1', '47:1', '47:0', '29:0'],
-      { stdio: 'ignore', env });
-    y.once('error', () => resolve(false));
-    y.once('exit', (code) => resolve(code === 0));
+      { stdio: ['ignore', 'ignore', 'pipe'], env });
+    let err = '';
+    y.stderr.on('data', (d) => { err += d; });
+    y.once('error', (e) => { pasteLog('ydotool spawn xəta: ' + e.message); resolve(false); });
+    y.once('exit', (code) => {
+      pasteLog(`ydotool key exit=${code}${err ? ' stderr: ' + err.trim() : ''} wayland=${env.WAYLAND_DISPLAY || '-'} xdg=${env.XDG_RUNTIME_DIR ? 'var' : 'yox'}`);
+      resolve(code === 0);
+    });
   });
   return pasted ? 'paste' : (copied ? 'clipboard' : false);
 }
