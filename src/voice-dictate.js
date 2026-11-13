@@ -49,7 +49,7 @@ const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_SCOPE = 'user:profile user:inference user:sessions:claude_code ' +
   'user:mcp_servers user:file_upload user:plugins';
-const KNOWN_GOOD_VERSION = '2.1.322';
+const KNOWN_GOOD_VERSION = '2.1.323'; // check-endpoint + kilid protokolu bu versiyada yoxlanılıb
 const KEEPALIVE_MS = 5000;
 const FINALIZE_TIMEOUT_MS = 6000;
 const MIN_BYTES = 8000; // ~0.25 saniyə səs
@@ -103,11 +103,38 @@ function userAgent() {
 }
 
 // ---------- token ----------
+// QAYDA: credentials faylının sahibi Claude Code-dur. Biz əsasən yalnız OXUYURUQ.
+// Claude Code tokeni bitməsinə 5 dəq qalmış özü yeniləyir; biz yalnız token həqiqətən
+// bitirsə (<30s) yeniləyirik və onda Claude Code-un ÖZ kilid protokoluna qoşuluruq
+// (Claude Code 2.1.323 bundle-dan, PROJECT_MEMORY §3):
+//   1) ~/.claude/.oauth_refresh.lock  2) <realpath ~/.claude>.lock   (proper-lockfile:
+//      mkdir ilə alınır, mtime hər 5s yenilənir, 60s-dən köhnə = ölü)
+//   3) kilid altında faylı yenidən oxu — token dəyişibsə, başqası yeniləyib → onu işlət
+//   4) CAS yazma: fayldakı refreshToken hələ də bizim göndərdiyimizdirsə yaz
+//   5) uğursuzluqda HEÇ NƏ silmə/dəyişmə (Claude Code invalid_grant-da tokenləri silir,
+//      biz silmirik) — fayldakı tokenə qayıt
+// Claude Code yenilənib kilid protokolu bundle-dan itibsə → yeniləmirik (fail-safe).
+const REFRESH_IF_EXPIRES_WITHIN_MS = 30000;
+const CC_LOCK_STALE_MS = 60000;
+const CC_LOCK_UPDATE_MS = 5000;
+const CC_LOCK_WAIT_MS = 20000;
+const LOCKCHECK_CACHE = path.join(HOME, '.cache', APP + '.lockcheck.json');
+
 function readOauth() {
-  const c = JSON.parse(fs.readFileSync(CRED_PATH, 'utf8'));
-  const o = c.claudeAiOauth || c;
-  if (!o.accessToken) throw new Error('claude.ai token tapılmadı');
-  return { file: c, oauth: o };
+  let last;
+  for (let i = 0; i < 5; i++) { // Claude Code yazarkən oxuya bilərik — bir neçə cəhd
+    try {
+      const c = JSON.parse(fs.readFileSync(CRED_PATH, 'utf8'));
+      const o = c.claudeAiOauth;
+      if (!o || !o.accessToken) throw new Error('claude.ai token tapılmadı — Claude Code-da /login et');
+      return { file: c, oauth: o };
+    } catch (e) {
+      last = e;
+      if (e.code === 'ENOENT' || /token tapılmadı/.test(e.message)) break;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+  }
+  throw last;
 }
 
 function expOf(oauth) {
@@ -115,79 +142,141 @@ function expOf(oauth) {
     : (Date.parse(oauth.expiresAt) || 0);
 }
 
-// Refresh token rotasiya olunur: eyni köhnə refresh_token-i iki proses işlədərsə,
-// biri invalid_grant alır → Claude Code yenidən /login istəyə bilər.
-// Ona görə: (1) bizim proseslər arasında lock, (2) yeniləmədən dərhal əvvəl faylı
-// yenidən oxu — başqası (Claude Code) artıq yeniləyibsə, onun tokenini işlət.
-const REFRESH_LOCK = path.join(HOME, '.cache', APP + '.refresh.lock');
-async function withRefreshLock(fn) {
-  for (let i = 0; i < 50; i++) {
-    try {
-      const fd = fs.openSync(REFRESH_LOCK, 'wx');
-      fs.closeSync(fd);
-      try { return await fn(); } finally { try { fs.unlinkSync(REFRESH_LOCK); } catch {} }
-    } catch (e) {
+// Claude Code bundle-ında kilid protokolunun hələ də eyni olduğunu yoxla (versiya üzrə keşlənir)
+function ccLockProtocolOk() {
+  const v = latestClaudeVersion();
+  if (!v) return false;
+  const file = path.join(CLAUDE_VERSIONS, v);
+  let st; try { st = fs.statSync(file); } catch { return false; }
+  const key = `${v}:${st.size}:${st.mtimeMs}`;
+  try {
+    const c = JSON.parse(fs.readFileSync(LOCKCHECK_CACHE, 'utf8'));
+    if (c.key === key) return c.ok;
+  } catch {}
+  let ok = false;
+  try {
+    const buf = fs.readFileSync(file);
+    ok = ['.oauth_refresh.lock', 'stale:60000,update:5000', 'claudeAiOauth',
+      'grant_type:"refresh_token"'].every((n) => buf.indexOf(n) !== -1);
+  } catch {}
+  try { fs.writeFileSync(LOCKCHECK_CACHE, JSON.stringify({ key, ok })); } catch {}
+  return ok;
+}
+
+function ccLockPaths() {
+  const dir = path.join(HOME, '.claude');
+  let real = dir; try { real = fs.realpathSync(dir); } catch {}
+  return [path.join(dir, '.oauth_refresh.lock'), real + '.lock'];
+}
+
+// proper-lockfile ilə uyğun kilid: mkdir; mövcuddursa və mtime 60s-dən köhnədirsə ölü sayılır
+async function acquireDirLock(p, deadline) {
+  for (;;) {
+    try { fs.mkdirSync(p); break; } catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      try { // 30s-dən köhnə lock ölü prosesdən qalıb
-        if (Date.now() - fs.statSync(REFRESH_LOCK).mtimeMs > 30000) fs.unlinkSync(REFRESH_LOCK);
-      } catch {}
-      await new Promise((r) => setTimeout(r, 200));
+      try {
+        if (Date.now() - fs.statSync(p).mtimeMs > CC_LOCK_STALE_MS) {
+          fs.rmSync(p, { recursive: true, force: true }); continue;
+        }
+      } catch { continue; }
+      if (Date.now() > deadline) return null;
+      await new Promise((r) => setTimeout(r, 1000 + Math.random() * 1000));
     }
   }
-  return fn(); // 10s gözlədik — lock-suz davam
+  const t = setInterval(() => { // sahib canlıdır — mtime-ı təzələ
+    try { const now = new Date(); fs.utimesSync(p, now, now); } catch {}
+  }, CC_LOCK_UPDATE_MS);
+  return () => { clearInterval(t); try { fs.rmdirSync(p); } catch {} };
+}
+
+async function withClaudeCodeLock(fn) {
+  const [primary, legacy] = ccLockPaths();
+  const deadline = Date.now() + CC_LOCK_WAIT_MS;
+  const rel1 = await acquireDirLock(primary, deadline);
+  if (!rel1) return { busy: true };
+  const rel2 = await acquireDirLock(legacy, deadline);
+  if (!rel2) { rel1(); return { busy: true }; }
+  try { return { value: await fn() }; } finally { rel2(); rel1(); }
 }
 
 // failedToken: server 401 verdiyi token (force rejimində)
 async function ensureAccessToken(force, failedToken) {
   const first = readOauth().oauth;
-  if (!force && expOf(first) > Date.now() + 60000) return first.accessToken;
+  if (force && failedToken && first.accessToken !== failedToken) return first.accessToken;
+  if (!force && expOf(first) - Date.now() > REFRESH_IF_EXPIRES_WITHIN_MS) return first.accessToken;
+  if (!first.refreshToken) throw new Error('refresh token yoxdur — Claude Code-u aç və ya /login et');
 
-  return withRefreshLock(async () => {
-    // lock-u gözləyərkən başqası yeniləmiş ola bilər
-    const { file, oauth } = readOauth();
-    const someoneRefreshed = force
-      ? (failedToken && oauth.accessToken !== failedToken)
-      : expOf(oauth) > Date.now() + 60000;
-    if (someoneRefreshed) { log('token artıq başqası tərəfindən yenilənib'); return oauth.accessToken; }
-    if (!oauth.refreshToken) return oauth.accessToken;
-    log('token müddəti bitib, yenilənir...');
-    return doRefresh(file, oauth);
+  if (!ccLockProtocolOk()) {
+    throw new Error('token bitib; Claude Code-un kilid protokolu tanınmadı — təhlükəsizlik üçün ' +
+      'yeniləmirəm. Claude Code-u bir dəfə aç (o özü yeniləyəcək), sonra yenidən cəhd et.');
+  }
+
+  const r = await withClaudeCodeLock(async () => {
+    const { oauth } = readOauth(); // kilid altında təzə oxu
+    if (oauth.accessToken !== first.accessToken) {
+      log('token artıq Claude Code tərəfindən yenilənib');
+      return oauth.accessToken;
+    }
+    if (!force && expOf(oauth) - Date.now() > REFRESH_IF_EXPIRES_WITHIN_MS) return oauth.accessToken;
+    log('token bitir, Claude Code kilidi altında yenilənir...');
+    return doRefresh(oauth);
   });
+  if (r.busy) {
+    // Claude Code hazırda yeniləyir — bitəndən sonra faylda təzə token olacaq
+    const now = readOauth().oauth;
+    if (now.accessToken !== first.accessToken) return now.accessToken;
+    throw new Error('token yenilənir (Claude Code kilidi məşğuldur) — bir az sonra yenidən cəhd et');
+  }
+  return r.value;
 }
 
-async function doRefresh(file, oauth) {
+async function doRefresh(oauth) {
+  const posted = oauth.refreshToken;
+  let j;
   try {
     const res = await fetch(OAUTH_TOKEN_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'User-Agent': userAgent() },
       body: JSON.stringify({
         grant_type: 'refresh_token',
-        refresh_token: oauth.refreshToken,
-        client_id: OAUTH_CLIENT_ID,
-        scope: OAUTH_SCOPE,
+        refresh_token: posted,
+        client_id: oauth.clientId || OAUTH_CLIENT_ID,
+        scope: Array.isArray(oauth.scopes) && oauth.scopes.length ? oauth.scopes.join(' ') : OAUTH_SCOPE,
       }),
     });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const j = await res.json();
-    oauth.accessToken = j.access_token;
-    if (j.refresh_token) oauth.refreshToken = j.refresh_token;
-    oauth.expiresAt = Date.now() + (j.expires_in || 3600) * 1000;
-    if (j.refresh_token_expires_in) oauth.refreshTokenExpiresAt = Date.now() + j.refresh_token_expires_in * 1000;
-    // yazmadan dərhal əvvəl ən təzə faylı oxu (mcpOAuth və s. digər açarlar itməsin)
-    let fresh = file;
-    try { fresh = JSON.parse(fs.readFileSync(CRED_PATH, 'utf8')); } catch {}
-    if (fresh.claudeAiOauth) fresh.claudeAiOauth = { ...fresh.claudeAiOauth, ...oauth };
-    else Object.assign(fresh, oauth);
-    const tmp = CRED_PATH + '.' + process.pid + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(fresh, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, CRED_PATH);
-    log('token yeniləndi');
-    return oauth.accessToken;
+    if (!res.ok) {
+      let body = ''; try { body = (await res.text()).slice(0, 200); } catch {}
+      throw new Error(`HTTP ${res.status} ${body}`);
+    }
+    j = await res.json();
   } catch (e) {
-    // uğursuz oldu (məs. invalid_grant — başqası rotasiya edib): fayldakı ən təzə tokeni işlət
-    log('token yenilənmədi (' + e.message + '), fayldakı token işlədilir');
-    try { return readOauth().oauth.accessToken; } catch { return oauth.accessToken; }
+    // faylda heç nə dəyişmirik — Claude Code özü idarə etsin
+    log('token yenilənmədi: ' + e.message);
+    throw new Error('token yenilənmədi (' + e.message.slice(0, 80) + '). Claude Code-u aç; ' +
+      'lazım olsa /login.');
   }
+  const now = Date.now();
+  const upd = {
+    accessToken: j.access_token,
+    refreshToken: j.refresh_token || posted,
+    expiresAt: now + (j.expires_in || 3600) * 1000,
+  };
+  if (j.refresh_token_expires_in) upd.refreshTokenExpiresAt = now + j.refresh_token_expires_in * 1000;
+  if (typeof j.scope === 'string' && j.scope) upd.scopes = j.scope.split(/\s+/);
+
+  // CAS: yalnız fayldakı refreshToken hələ də göndərdiyimizdirsə yaz
+  const { file: fresh } = readOauth();
+  if (fresh.claudeAiOauth.refreshToken !== posted) {
+    log('CAS: fayl arada dəyişib, yazmıram');
+    return fresh.claudeAiOauth.accessToken;
+  }
+  fresh.claudeAiOauth = { ...fresh.claudeAiOauth, ...upd };
+  let mode = 0o600; try { mode = fs.statSync(CRED_PATH).mode & 0o777; } catch {}
+  const tmp = path.join(path.dirname(CRED_PATH), `.${path.basename(CRED_PATH)}.${process.pid}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify(fresh, null, 2), { mode });
+  fs.renameSync(tmp, CRED_PATH);
+  log('token yeniləndi (Claude Code kilidi altında)');
+  return upd.accessToken;
 }
 
 // ---------- audio yazıcı ----------
@@ -579,6 +668,8 @@ function checkEndpoint(version) {
     ['param endpointing_ms', 'endpointing_ms'],
     ['param utterance_end_ms', 'utterance_end_ms'],
     ['param use_conversation_engine', 'use_conversation_engine'],
+    ['Claude Code token kilidi', '.oauth_refresh.lock'],
+    ['kilid parametrləri', 'stale:60000,update:5000'],
     ['mesaj KeepAlive', 'KeepAlive'],
     ['mesaj CloseStream', 'CloseStream'],
     ['mesaj TranscriptText', 'TranscriptText'],

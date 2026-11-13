@@ -8,7 +8,12 @@ SHARE="$HOME/.local/share/voice-dictate2"
 BIN="$HOME/.local/bin"
 UNITS="$HOME/.config/systemd/user"
 KWIN="$HOME/.local/share/kwin/scripts/voicedictate2"
-NODE="$(command -v node)"
+# Sabit yol: nvm versiyası dəyişəndə servis sınmasın deyə sistem node-u (pacman) üstündür
+if [ -x /usr/bin/node ] && [ "$(/usr/bin/node -p 'process.versions.node.split(".")[0]')" -ge 20 ]; then
+  NODE=/usr/bin/node
+else
+  NODE="$(command -v node)"
+fi
 SHORTCUT="${VD_SHORTCUT:-Ctrl+Alt+Space}"
 
 for t in node npm pw-record wl-copy ydotool qdbus6 notify-send; do

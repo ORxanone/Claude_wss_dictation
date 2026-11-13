@@ -53,6 +53,27 @@ Yol: `grep -aob "speech_to_text"` → offset → `dd` ilə konteksti çıxarmaq.
 - Token 401 verərsə: daemon məcburi yeniləyib bir dəfə yenidən qoşulur
 - Claude Code özü də tokeni yeniləyir — onu işlətəndə fayl təzələnir
 
+### 3a. Claude Code-un öz yeniləmə protokolu (2.1.323 bundle-dan, 2026-11-13 araşdırıldı)
+- Bitməsinə **5 dəq** qalmış yeniləyir (`uI`: `now+300000 >= expiresAt`).
+- **İki kilid** (proper-lockfile, `mkdir` əsaslı, `stale:60000, update:5000`):
+  1. `~/.claude/.oauth_refresh.lock`  2. `<realpath ~/.claude>.lock` (= `~/.claude.lock`).
+  Tutulubsa 5 dəfə 1–2s gözləyir; mtime dəyişmirsə sahibi ölü sayır.
+- Kilid altında faylı yenidən oxuyur: accessToken dəyişibsə → "race resolved", yeniləmir.
+- Yazma **CAS**-dır: yalnız fayldakı refreshToken göndərdiyinə bərabərdirsə yazır.
+- **`invalid_grant` alanda (`OHo`) diskdəki accessToken+refreshToken-i SİLİR** → `/login` tələb olunur.
+  Yəni kənar proses eyni refresh_token-i Claude Code ilə eyni anda işlətsə, Claude Code-un girişi itə bilər.
+- `claude auth status` tokeni YENİLƏMİR (delegasiya üçün yararsızdır).
+
+### 3b. v2-nin token qaydası (bu protokola qoşulur)
+- Token bitməsinə >30s qalıbsa — yalnız OXUYUR (Claude Code açıqdırsa həmişə ilk o yeniləyir).
+- Bitirsə: Claude Code-un **hər iki kilidini** eyni qaydada götürür (mtime hər 5s), kilid altında
+  yenidən oxuyur, CAS ilə atomik yazır (mode qorunur, mcpOAuth və s. qalır), scopes/clientId fayldan.
+- Uğursuzluqda faylda **heç nə dəyişmir/silinmir**, istifadəçiyə bildiriş.
+- Kilid 20s məşğuldursa — yeniləmir, fayldakı təzə tokeni gözləyir.
+- Bundle-da kilid protokolu tanınmırsa (Claude Code dəyişib) — **yeniləmir** (fail-safe), versiya üzrə keşlənir.
+- Testlər: `NODE_PATH=... node test/token.test.js` (saxta HOME + saxta fetch, 8 ssenari).
+- ⚠️ **v1-in token kodu bu qorumaya MALİK DEYİL** (kilidsiz, CAS-sız, 60s həddi, 401-də məcburi yeniləmə).
+
 ---
 
 ## 4. Arxitektura (hansı yollarla qurulub)
@@ -117,7 +138,7 @@ Ctrl+Space (fiziki)
 - ✅ (v2) System tray ikonu (StatusNotifierItem, dbus-next)
 - ✅ (v2) `voice-dictate2 check-endpoint` avtomatik yoxlayır. Claude Code update olarsa endpoint dəyişə bilər → yenidən `grep -aob "speech_to_text"` ilə yoxla (bu README-dəki protokol bölməsi kömək edər)
 - ✅ (v2) `VD_SHORTCUT=... ./install.sh`. Qısayolu dəyişmək istəsə: Shortcuts-də "Voice Dictate Toggle" (KWin script qeydiyyatı) və ya main.js-də keySequence
-11. **Token yarışı:** refresh_token rotasiya olunur. Eyni köhnə refresh_token-i iki proses (Claude Code, Zed claude-acp agentləri, bizim daemon) işlədərsə, biri `invalid_grant` alır → `/login` tələb oluna bilər. v2-də: lock faylı (`~/.cache/voice-dictate2.refresh.lock`), yeniləmədən əvvəl faylı yenidən oxumaq (başqası yeniləyibsə onu işlət), 401-də fayldakı token fərqlidirsə yeniləmədən onu işlət, yazanda ən təzə faylla birləşdir (mcpOAuth itməsin), uğursuzluqda fayldakı tokenə qayıt.
+11. **Token yarışı** (ətraflı və son həll: §3a/§3b; aşağıdakı ilkin v2 həlli əvəz olunub): refresh_token rotasiya olunur. Eyni köhnə refresh_token-i iki proses (Claude Code, Zed claude-acp agentləri, bizim daemon) işlədərsə, biri `invalid_grant` alır → `/login` tələb oluna bilər. v2-də: lock faylı (`~/.cache/voice-dictate2.refresh.lock`), yeniləmədən əvvəl faylı yenidən oxumaq (başqası yeniləyibsə onu işlət), 401-də fayldakı token fərqlidirsə yeniləmədən onu işlət, yazanda ən təzə faylla birləşdir (mcpOAuth itməsin), uğursuzluqda fayldakı tokenə qayıt.
 12. `~/.config/kwinrc`-dəki `voicedictateEnabled=true` girişi KWin tərəfindən silinə bilər — problem deyil, hotkey servisi hər login-də `loadScript`+`start` edir.
 
 - ⬜ **Qeyri-rəsmi istifadədir** — Anthropic ToS riski istifadəçiyə məxsusdur, şəxsi istifadə üçün
@@ -167,14 +188,16 @@ v1-in snapşotundan törəyib; v1-ə toxunmur. Quraşdırma: `cd ~/voice-dictate
 - `sessionEnv()`: XDG_RUNTIME_DIR / WAYLAND_DISPLAY / YDOTOOL_SOCKET avtomatik.
 - ydotool 3s timeout (child ilişmir).
 - `restoreClipboard`: uğurlu paste-dən 1s sonra əvvəlki clipboard mətni qaytarılır; transcript Super+V tarixçəsində qalır. Paste alınmayıbsa transcript clipboard-da qalır.
-- Token yarışına qarşı qoruma (§5 №11).
+- Token yarışına qarşı qoruma — Claude Code-un öz kilid protokoluna qoşulur (§3a, §3b).
+- Servis sistem node-u (`/usr/bin/node`, ≥20) ilə işləyir — nvm versiya dəyişəndə sınmır.
 
 **Hələ real mikrofonla test olunmayıb:** səssizlik avto-dayandırma, avtomatik paste, clipboard bərpası (v2 quraşdırılmalıdır).
 
 **v2 test əmrləri:**
 ```bash
 voice-dictate2 test 10
-voice-dictate2 check-endpoint
+voice-dictate2 check-endpoint      # protokol + Claude Code kilid protokolu
+NODE_PATH=~/.local/share/voice-dictate2/node_modules node ~/voice-dictate-v2/test/token.test.js
 systemctl --user status voice-dictate2 voice-dictate2-hotkey
 qdbus6 org.kde.StatusNotifierWatcher /StatusNotifierWatcher org.kde.StatusNotifierWatcher.RegisteredStatusNotifierItems
 cat ~/.cache/voice-dictate2-paste.log ~/.cache/voice-dictate2-hotkey.log
