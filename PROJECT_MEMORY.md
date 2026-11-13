@@ -92,6 +92,9 @@ Ctrl+Space (fiziki)
 5. dbus-next API: `dbus.interface.Interface` sinfini extend et, `constructor(){super('org.local.VoiceDictate')}`, `configureMembers({methods:{Toggle:{inSignature:'',outSignature:''}}})`, `bus.export(path, instance)`.
 6. systemd user env-də WAYLAND_DISPLAY var — amma daemon Plazma env-i set etməzdən ƏVVƏL qalxarsa proses env-ində olmur → `wl-copy` səssizcə işləmir (clipboard boş qalır, notification DBus-dan işlədiyi üçün səhv görünmür). Həll: `waylandEnv()` — `XDG_RUNTIME_DIR`-də `wayland-*` socket-i avtomatik tapır (2026-11-13).
 7. **ydotool `type` qeyri-ASCII hərfləri ATIR** (ə, ş, ö, ü, ı, ç — US keymap limiti; "Sən→Sn", "yaxşı→yax"). Həll: wl-copy + `ydotool key 29:1 47:1 47:0 29:0` (Ctrl+V paste) — Unicode tam düşür. `type` yalnız fallback; paste-dən əvvəl 200ms gözlə (wl-copy clipboard-u ələ alsın).
+8. **ydotool client socket-i:** default `$XDG_RUNTIME_DIR/.ydotool_socket`; `XDG_RUNTIME_DIR` yoxdursa `/tmp/.ydotool_socket`-a baxır → uğursuz. Daemon child-də env-i tamamla (v2-də `sessionEnv()`).
+9. **ydotool bəzən cavab vermir** → client prosesi əbədi qalır, diktə child-i paste-də ilişir (2026-11-13 real hadisə). Həll (v2): 3s timeout, sonra kill.
+10. **Diktə clipboard-u əvəz edir — istifadəçini çaşdıra bilər:** diktədən sonra Ctrl+V transcript verir, istifadəçi başqa mətn kopyalayana qədər belə. Login kodu kimi vacib kopyalama arxasında diktə bitibsə, kopyalamanın təsdiqini yoxla (`wl-paste`). (2026-11-13: /login kod paste-i köhnə transcript ilə səhv düşdü)
 
 ---
 
