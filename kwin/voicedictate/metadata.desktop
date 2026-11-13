@@ -1,0 +1,4 @@
+[Desktop Entry]
+Type=Service
+X-KDE-PluginInfo-Name=voicedictate
+X-KDE-ServiceTypes=KWin/Script

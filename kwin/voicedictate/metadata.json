@@ -1,0 +1,1 @@
+{"KPackageStructure": "KWin/Script", "KPlugin": {"Id": "voicedictate", "Name": "Voice Dictate", "Description": "Ctrl+Space dictation via Anthropic STT", "Version": "1.0", "License": "MIT"}}

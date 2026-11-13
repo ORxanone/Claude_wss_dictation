@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.local.VoiceDictate
+Exec=/home/patriot/.nvm/versions/node/v24.18.0/bin/node /home/patriot/.local/share/voice-dictate/voice-dictate.js listen
