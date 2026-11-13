@@ -177,6 +177,43 @@ Sonra istədiyini əlavə et (tray, dil dəyişmə, wtype, və s.).
 
 ---
 
+## 11. Veb backend (git `web-backend` branch) — ABUNƏLİKSİZ
+
+Claude Code tokeni (Pro/Max) olmadan, **pulsuz claude.ai hesabı** ilə işləyir. Brauzerdən `sessionKey`
+cookie götürülür. Endpoint eynidir, yalnız host `claude.ai`, giriş cookie ilədir.
+
+**Kəşf (2026-11-13, canlı test — həm abunəli, həm pulsuz hesabla təsdiq):**
+- `wss://claude.ai/api/ws/speech_to_text/voice_stream?...&stt_provider=deepgram-nova3&keepalive_ack=true&client_platform=web_claude_ai&organization_uuid=<org>`
+- Başlıqlar: `Origin: https://claude.ai`, `Cookie: sessionKey=sk-ant-sid02-...`, brauzer `User-Agent`. Cloudflare cookie-ləri (cf_clearance, __cf_bm) LAZIM DEYİL.
+- Mesaj protokolu eynidir (KeepAlive/CloseStream/TranscriptText/TranscriptEndpoint); əlavə `KeepAliveAck` gəlir.
+- `az` yenə rədd (harmonic provider), `tr` azərbaycancanı düzgün yazır.
+- **Pulsuz hesabda işləyir** (test: "Deməli belə, səndən bir iş görəcəyik..." düzgün transkripsiya).
+
+**Konfiq:** `~/.config/voice-dictate2.web.json` = `{"sessionKey":"sk-ant-sid02-...","organizationUuid":"<lastActiveOrg>"}`, **0600**.
+`~/.config/voice-dictate2.json` → `"backend":"web"`. Repoya düşmür (`.gitignore: *.web.json`).
+
+**Əmrlər:**
+```bash
+voice-dictate2 web-login      # sessionKey + organizationUuid soruşur (tarixçəyə düşmür), 0600 yazır
+voice-dictate2 backend web    # backend-i dəyiş; sonra: systemctl --user restart voice-dictate2
+voice-dictate2 backend        # cari backend
+voice-dictate2 web-check      # cookie-ni yoxla (səssiz 2s qoşulma)
+voice-dictate2 backend anthropic   # Claude Code tokeninə qayıt
+```
+
+**İki backend arasında keçid:**
+| Hədəf | Addımlar |
+|---|---|
+| Claude Code tokeni (Pro/Max) → **anthropic** | `voice-dictate2 backend anthropic && systemctl --user restart voice-dictate2` |
+| Pulsuz claude.ai → **web** | (ilk dəfə) `voice-dictate2 web-login` → sonra `voice-dictate2 backend web && systemctl --user restart voice-dictate2` |
+
+**Vacib fərqlər / dərslər:**
+- `sessionKey` hesabın TAM açarıdır (token-dən riskli). 0600 faylda, repoya düşmür.
+- `sessionKey` müddəti bitir, avto-yenilənmir → `web-login` ilə yenidən yaz. Brauzerdə çıxış edilsə köhnəlir (401/403 → aydın mesaj).
+- Web backend Claude Code bundle-ından asılı deyil → `watchClaudeUpdates`/`check-endpoint` web rejimində işləmir.
+- Testlər (şəbəkəsiz): `node test/web.test.js` (6 ssenari — url/cookie/icazə/sızma).
+- ⚠️ Qeyri-rəsmi istifadə, ToS riski istifadəçiyə aiddir (hər iki backend üçün).
+
 ## 10. v2 (`~/voice-dictate-v2`, git `v2` branch)
 
 v1-in snapşotundan törəyib; v1-ə toxunmur. Quraşdırma: `cd ~/voice-dictate-v2 && ./install.sh` (silmək: `./uninstall.sh`).

@@ -45,6 +45,11 @@ const PASTE_LOG = path.join(HOME, '.cache', APP + '-paste.log');
 const CLAUDE_VERSIONS = path.join(HOME, '.local', 'share', 'claude', 'versions');
 
 const WS_BASE = 'wss://api.anthropic.com/api/ws/speech_to_text/voice_stream';
+// Veb backend (claude.ai, abunəlik tələb etmir — pulsuz hesabla da işləyir):
+const WEB_WS_BASE = 'wss://claude.ai/api/ws/speech_to_text/voice_stream';
+const WEB_CRED_PATH = path.join(HOME, '.config', APP + '.web.json'); // {sessionKey, organizationUuid}
+const WEB_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36';
 const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_SCOPE = 'user:profile user:inference user:sessions:claude_code ' +
@@ -62,6 +67,7 @@ const DEFAULTS = {
   tray: true,              // system tray ikonu
   restoreClipboard: true,  // paste-dən sonra əvvəlki clipboard-u qaytar (transcript Super+V-də qalır)
   clientVersion: '',       // boş = Claude Code versiyası avtomatik
+  backend: 'anthropic',    // 'anthropic' = Claude Code tokeni (Pro/Max) | 'web' = claude.ai cookie (pulsuz)
 };
 
 function cfg() {
@@ -307,6 +313,46 @@ async function doRefresh(oauth) {
   return upd.accessToken;
 }
 
+// ---------- veb backend (claude.ai cookie) ----------
+// Konfiq: ~/.config/voice-dictate2.web.json → {"sessionKey":"sk-ant-sid02-...","organizationUuid":"..."}
+// sessionKey hesabın tam açarıdır — fayl 0600 olmalıdır. Repoya düşmür.
+function readWebCred() {
+  let c;
+  try { c = JSON.parse(fs.readFileSync(WEB_CRED_PATH, 'utf8')); }
+  catch { throw new Error(`veb konfiqi yoxdur: ${WEB_CRED_PATH} — "voice-dictate2 web-login" işlət`); }
+  if (!c.sessionKey) throw new Error('web.json-da sessionKey yoxdur');
+  if (!c.organizationUuid) throw new Error('web.json-da organizationUuid yoxdur');
+  return c;
+}
+
+// Backend-ə görə WS url + başlıqlar. Mesaj protokolu hər iki backend-də eynidir.
+function buildConnection(language) {
+  const c = cfg();
+  if (c.backend === 'web') {
+    const wc = readWebCred();
+    const params = new URLSearchParams({
+      encoding: 'linear16', sample_rate: '16000', channels: '1',
+      endpointing_ms: '300', utterance_end_ms: '1000', language,
+      use_conversation_engine: 'true', stt_provider: 'deepgram-nova3',
+      keepalive_ack: 'true', client_platform: 'web_claude_ai',
+      organization_uuid: wc.organizationUuid,
+    });
+    return {
+      backend: 'web',
+      url: `${WEB_WS_BASE}?${params}`,
+      headers: { 'Origin': 'https://claude.ai', 'User-Agent': WEB_UA,
+        'Cookie': 'sessionKey=' + wc.sessionKey },
+    };
+  }
+  // default: anthropic (Claude Code tokeni ensureAccessToken ilə asinxron gəlir)
+  const params = new URLSearchParams({
+    encoding: 'linear16', sample_rate: '16000', channels: '1',
+    endpointing_ms: '300', utterance_end_ms: '1000', language,
+    use_conversation_engine: 'true',
+  });
+  return { backend: 'anthropic', url: `${WS_BASE}?${params}` };
+}
+
 // ---------- audio yazıcı ----------
 function startRecorder() {
   let child = spawn('pw-record', ['--rate', '16000', '--channels', '1',
@@ -336,27 +382,21 @@ function rms(buf) {
 async function recordAndTranscribe(opts, onChunk, allowRetry = true) {
   const c = cfg();
   const language = process.env.VD_LANG || c.language;
-  const token = await ensureAccessToken();
+  const conn = buildConnection(language);
 
-  const params = new URLSearchParams({
-    encoding: 'linear16',
-    sample_rate: '16000',
-    channels: '1',
-    endpointing_ms: '300',
-    utterance_end_ms: '1000',
-    language,
-    use_conversation_engine: 'true',
-  });
-
-  const ws = new WebSocket(`${WS_BASE}?${params}`, {
-    headers: {
+  const headers = { ...conn.headers };
+  let token = null;
+  if (conn.backend === 'anthropic') {
+    token = await ensureAccessToken();
+    Object.assign(headers, {
       'Authorization': `Bearer ${token}`,
       'User-Agent': userAgent(),
       'x-app': 'cli',
       'anthropic-client-platform': 'Linux',
-    },
-    handshakeTimeout: 10000,
-  });
+    });
+  }
+
+  const ws = new WebSocket(conn.url, { headers, handshakeTimeout: 10000 });
 
   try {
     await new Promise((resolve, reject) => {
@@ -370,11 +410,15 @@ async function recordAndTranscribe(opts, onChunk, allowRetry = true) {
       });
     });
   } catch (e) {
-    // 401 → məcburi token yenilə, bir dəfə cəhd et
-    if (e.statusCode === 401 && allowRetry) {
+    if (conn.backend === 'anthropic' && e.statusCode === 401 && allowRetry) {
+      // 401 → məcburi token yenilə, bir dəfə cəhd et
       log('401: token yenilənir və yenidən qoşulur...');
       await ensureAccessToken(true, token);
       return recordAndTranscribe(opts, onChunk, false);
+    }
+    if (conn.backend === 'web' && (e.statusCode === 401 || e.statusCode === 403)) {
+      e.message = 'claude.ai sessionKey köhnəlib və ya rədd olundu — ' +
+        '"voice-dictate2 web-login" ilə yenisini yaz (HTTP ' + e.statusCode + ')';
     }
     throw e;
   }
@@ -616,8 +660,9 @@ function childMain() {
   }).catch((e) => {
     clearState();
     let msg = String(e.message || e);
-    // server/protokol xətası → Claude Code yenilənib protokol dəyişmiş ola bilər
-    if (/WS rədd|HTTP 4\d\d|HTTP 5\d\d|gözlənilmədən bağlandı|transkripsiya xətası|server xətası/.test(msg)) {
+    // anthropic backend: server/protokol xətası → Claude Code yenilənib protokol dəyişmiş ola bilər
+    if (cfg().backend !== 'web' &&
+        /WS rədd|HTTP 4\d\d|HTTP 5\d\d|gözlənilmədən bağlandı|transkripsiya xətası|server xətası/.test(msg)) {
       const r = protocolCheck();
       msg += r && !r.ok
         ? `\n⚠️ Claude Code ${r.version}-də protokol dəyişib — voice-dictate2 check-endpoint`
@@ -664,9 +709,62 @@ async function parentMain(cmd, args) {
       console.log(stateAlive() ? 'yazır (pid ' + readState().pid + ')' : 'boşta');
       break;
     }
+    case 'backend': {
+      // arqumentsiz: cari backend; arqumentlə: dəyiş (anthropic | web)
+      const cur = cfg().backend;
+      if (!args[0]) { console.log('cari backend: ' + cur); break; }
+      const want = args[0];
+      if (want !== 'anthropic' && want !== 'web') {
+        console.error('backend yalnız "anthropic" və ya "web" ola bilər'); process.exitCode = 1; break;
+      }
+      if (want === 'web') { try { readWebCred(); } catch (e) {
+        console.error('web backend hazır deyil: ' + e.message); process.exitCode = 1; break; } }
+      let conf = {}; try { conf = JSON.parse(fs.readFileSync(CFG_PATH, 'utf8')); } catch {}
+      conf.backend = want;
+      fs.writeFileSync(CFG_PATH, JSON.stringify(conf, null, 2));
+      console.log(`backend: ${cur} → ${want}. Tətbiq üçün: systemctl --user restart ${APP}`);
+      break;
+    }
+    case 'web-login': {
+      // sessionKey + organizationUuid-i stdin-dən oxu (əmr tarixçəsinə düşməsin), fayla 0600 yaz.
+      // TTY: sətir-sətir soruşur. Pipe: iki sətir gözləyir (sessionKey\norganizationUuid).
+      let existing = {}; try { existing = JSON.parse(fs.readFileSync(WEB_CRED_PATH, 'utf8')); } catch {}
+      let sk, org;
+      if (process.stdin.isTTY) {
+        const readline = require('readline');
+        const ask = (q) => new Promise((res) => {
+          const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+          rl.question(q, (a) => { rl.close(); res(a.trim()); });
+        });
+        console.error('claude.ai → F12 → Application → Cookies: sessionKey və lastActiveOrg dəyərlərini götür.');
+        sk = await ask('sessionKey: ');
+        org = await ask(`organizationUuid (lastActiveOrg)${existing.organizationUuid ? ' [' + existing.organizationUuid + ']' : ''}: `);
+      } else {
+        const data = fs.readFileSync(0, 'utf8').split('\n').map((s) => s.trim()).filter(Boolean);
+        sk = data[0]; org = data[1];
+      }
+      if (!sk || !sk.startsWith('sk-ant-sid')) { console.error('sessionKey "sk-ant-sid..." ilə başlamalıdır'); process.exitCode = 1; break; }
+      if (!org && existing.organizationUuid) org = existing.organizationUuid;
+      if (!/^[0-9a-f-]{36}$/.test(org || '')) { console.error('organizationUuid UUID formatında olmalıdır'); process.exitCode = 1; break; }
+      const tmp = WEB_CRED_PATH + '.' + process.pid + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify({ sessionKey: sk, organizationUuid: org }, null, 2), { mode: 0o600 });
+      fs.renameSync(tmp, WEB_CRED_PATH);
+      console.log('yazıldı: ' + WEB_CRED_PATH + ' (0600)');
+      console.log('web backend-ə keçmək üçün: voice-dictate2 backend web && systemctl --user restart ' + APP);
+      break;
+    }
+    case 'web-check': {
+      try {
+        readWebCred();
+        console.error('veb cookie yoxlanılır (səssiz 2s)...');
+        const r = await recordAndTranscribe({ seconds: 2 }, null);
+        console.log('web backend OK' + (r.transcript ? ' · "' + r.transcript + '"' : ' (səs yox, qoşulma işlədi)'));
+      } catch (e) { console.error('web backend XƏTA: ' + (e.message || e)); process.exitCode = 1; }
+      break;
+    }
     case 'test': {
       const seconds = parseInt(args[0] || '6', 10);
-      console.error(`TEST: ${seconds} san danış... (UA: ${userAgent()})`);
+      console.error(`TEST: ${seconds} san danış... (backend: ${cfg().backend})`);
       try {
         const r = await recordAndTranscribe({ seconds }, (t) => process.stderr.write('\r… ' + t.slice(-70)));
         process.stderr.write('\n');
@@ -689,7 +787,12 @@ async function parentMain(cmd, args) {
       listenMain();
       break;
     default:
-      console.log(`istifadə: ${APP} start|stop|toggle|cancel|status|test [san]|check-endpoint [versiya]|listen`);
+      console.log(`istifadə: ${APP} start|stop|toggle|cancel|status|test [san]|\n` +
+        `  backend [anthropic|web]   — backend-i göstər/dəyiş\n` +
+        `  web-login                 — claude.ai sessionKey yaz (pulsuz hesab, abunəliksiz)\n` +
+        `  web-check                 — veb cookie-ni yoxla\n` +
+        `  check-endpoint [versiya]  — Claude Code protokolunu yoxla (anthropic backend)\n` +
+        `  listen                    — daemon`);
   }
 }
 
@@ -713,6 +816,7 @@ function checkEndpoint(version) {
 const NOTIFIED_PATH = path.join(HOME, '.cache', APP + '.notified-version');
 function watchClaudeUpdates() {
   const run = () => {
+    if (cfg().backend === 'web') return; // web backend Claude Code bundle-ından asılı deyil
     const v = latestClaudeVersion();
     if (!v) return;
     let last = ''; try { last = fs.readFileSync(NOTIFIED_PATH, 'utf8').trim(); } catch {}
@@ -791,9 +895,10 @@ async function startTray(bus, dbus) {
     get ItemIsMenu() { return false; }
     get Menu() { return '/NO_DBUSMENU'; }
     get ToolTip() {
+      const be = cfg().backend === 'web' ? ' · web' : '';
       const sub = recording
         ? `Yazır… ${Math.round((Date.now() - since) / 1000)}s — sol klik: bitir, orta klik: ləğv`
-        : 'Boşta — sol klik: başlat';
+        : 'Boşta — sol klik: başlat' + be;
       return ['', [], 'Voice Dictate v2', sub];
     }
     Activate(x, y) { parentMain('toggle').catch(() => {}); }
