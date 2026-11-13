@@ -60,6 +60,7 @@ const DEFAULTS = {
   maxRecordMs: 120000,     // maksimum yazma müddəti
   silenceRms: 400,         // bu RMS-dən aşağı = səssizlik (s16, 0..32767)
   tray: true,              // system tray ikonu
+  restoreClipboard: true,  // paste-dən sonra əvvəlki clipboard-u qaytar (transcript Super+V-də qalır)
   clientVersion: '',       // boş = Claude Code versiyası avtomatik
 };
 
@@ -109,13 +110,52 @@ function readOauth() {
   return { file: c, oauth: o };
 }
 
-async function ensureAccessToken(force) {
-  const { file, oauth } = readOauth();
-  const exp = typeof oauth.expiresAt === 'number' ? oauth.expiresAt
+function expOf(oauth) {
+  return typeof oauth.expiresAt === 'number' ? oauth.expiresAt
     : (Date.parse(oauth.expiresAt) || 0);
-  if (!force && exp > Date.now() + 60000) return oauth.accessToken;
-  log('token müddəti bitib, yenilənir...');
-  if (!oauth.refreshToken) return oauth.accessToken;
+}
+
+// Refresh token rotasiya olunur: eyni köhnə refresh_token-i iki proses işlədərsə,
+// biri invalid_grant alır → Claude Code yenidən /login istəyə bilər.
+// Ona görə: (1) bizim proseslər arasında lock, (2) yeniləmədən dərhal əvvəl faylı
+// yenidən oxu — başqası (Claude Code) artıq yeniləyibsə, onun tokenini işlət.
+const REFRESH_LOCK = path.join(HOME, '.cache', APP + '.refresh.lock');
+async function withRefreshLock(fn) {
+  for (let i = 0; i < 50; i++) {
+    try {
+      const fd = fs.openSync(REFRESH_LOCK, 'wx');
+      fs.closeSync(fd);
+      try { return await fn(); } finally { try { fs.unlinkSync(REFRESH_LOCK); } catch {} }
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      try { // 30s-dən köhnə lock ölü prosesdən qalıb
+        if (Date.now() - fs.statSync(REFRESH_LOCK).mtimeMs > 30000) fs.unlinkSync(REFRESH_LOCK);
+      } catch {}
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+  return fn(); // 10s gözlədik — lock-suz davam
+}
+
+// failedToken: server 401 verdiyi token (force rejimində)
+async function ensureAccessToken(force, failedToken) {
+  const first = readOauth().oauth;
+  if (!force && expOf(first) > Date.now() + 60000) return first.accessToken;
+
+  return withRefreshLock(async () => {
+    // lock-u gözləyərkən başqası yeniləmiş ola bilər
+    const { file, oauth } = readOauth();
+    const someoneRefreshed = force
+      ? (failedToken && oauth.accessToken !== failedToken)
+      : expOf(oauth) > Date.now() + 60000;
+    if (someoneRefreshed) { log('token artıq başqası tərəfindən yenilənib'); return oauth.accessToken; }
+    if (!oauth.refreshToken) return oauth.accessToken;
+    log('token müddəti bitib, yenilənir...');
+    return doRefresh(file, oauth);
+  });
+}
+
+async function doRefresh(file, oauth) {
   try {
     const res = await fetch(OAUTH_TOKEN_URL, {
       method: 'POST',
@@ -132,15 +172,21 @@ async function ensureAccessToken(force) {
     oauth.accessToken = j.access_token;
     if (j.refresh_token) oauth.refreshToken = j.refresh_token;
     oauth.expiresAt = Date.now() + (j.expires_in || 3600) * 1000;
-    file.claudeAiOauth = oauth;
+    if (j.refresh_token_expires_in) oauth.refreshTokenExpiresAt = Date.now() + j.refresh_token_expires_in * 1000;
+    // yazmadan dərhal əvvəl ən təzə faylı oxu (mcpOAuth və s. digər açarlar itməsin)
+    let fresh = file;
+    try { fresh = JSON.parse(fs.readFileSync(CRED_PATH, 'utf8')); } catch {}
+    if (fresh.claudeAiOauth) fresh.claudeAiOauth = { ...fresh.claudeAiOauth, ...oauth };
+    else Object.assign(fresh, oauth);
     const tmp = CRED_PATH + '.' + process.pid + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(file, null, 2), { mode: 0o600 });
+    fs.writeFileSync(tmp, JSON.stringify(fresh, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, CRED_PATH);
     log('token yeniləndi');
     return oauth.accessToken;
   } catch (e) {
-    log('token yenilənmədi (' + e.message + '), köhnə token işlədilir');
-    return oauth.accessToken;
+    // uğursuz oldu (məs. invalid_grant — başqası rotasiya edib): fayldakı ən təzə tokeni işlət
+    log('token yenilənmədi (' + e.message + '), fayldakı token işlədilir');
+    try { return readOauth().oauth.accessToken; } catch { return oauth.accessToken; }
   }
 }
 
@@ -210,7 +256,7 @@ async function recordAndTranscribe(opts, onChunk, allowRetry = true) {
     // 401 → məcburi token yenilə, bir dəfə cəhd et
     if (e.statusCode === 401 && allowRetry) {
       log('401: token yenilənir və yenidən qoşulur...');
-      await ensureAccessToken(true);
+      await ensureAccessToken(true, token);
       return recordAndTranscribe(opts, onChunk, false);
     }
     throw e;
@@ -352,8 +398,30 @@ function copyToClipboard(text, env) {
   } catch { return false; }
 }
 
+// Əvvəlki clipboard mətnini oxu (yalnız mətn; şəkil/fayl olarsa null)
+function readClipboardText(env) {
+  return new Promise((resolve) => {
+    const run = (args) => new Promise((res) => {
+      let out = Buffer.alloc(0);
+      const p = spawn('wl-paste', args, { stdio: ['ignore', 'pipe', 'ignore'], env });
+      const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} res(null); }, 1000);
+      p.stdout.on('data', (d) => { out = Buffer.concat([out, d]); });
+      p.once('error', () => { clearTimeout(t); res(null); });
+      p.once('exit', (code) => { clearTimeout(t); res(code === 0 ? out : null); });
+    });
+    run(['--list-types']).then((types) => {
+      const t = types ? types.toString() : '';
+      if (!/^text\/plain/m.test(t) || /^image\//m.test(t)) return resolve(null);
+      run(['--no-newline', '--type', 'text/plain;charset=utf-8']).then((b) =>
+        resolve(b && b.length && b.length < 1024 * 1024 ? b.toString('utf8') : null));
+    });
+  });
+}
+
 async function pasteText(text) {
   const env = sessionEnv();
+  const { restoreClipboard } = cfg();
+  const previous = restoreClipboard ? await readClipboardText(env) : null;
   const copied = copyToClipboard(text, env);
   // paste-dən əvvəl wl-copy clipboard-u ələ alsın
   if (copied) await new Promise((r) => setTimeout(r, 200));
@@ -378,6 +446,16 @@ async function pasteText(text) {
       done(code === 0);
     });
   });
+  // Bərpa: transcript Klipper tarixçəsində (Super+V) qalır, amma Ctrl+V yenə
+  // istifadəçinin əvvəl kopyaladığını verir (2026-11-13 /login kodu çaşqınlığı).
+  // Yalnız paste uğurlu olanda — əks halda transcript clipboard-da lazımdır.
+  // Hədəf proqram datanı asinxron oxuyur, ona görə bərpadan əvvəl gözlə.
+  if (pasted && previous !== null && previous !== text) {
+    await new Promise((r) => setTimeout(r, 1000));
+    copyToClipboard(previous, env);
+    pasteLog('əvvəlki clipboard bərpa olundu');
+    return 'paste-restored';
+  }
   return pasted ? 'paste' : (copied ? 'clipboard' : false);
 }
 
@@ -408,7 +486,8 @@ function childMain() {
     const how = await pasteText(text);
     const reason = r.how === 'silence' ? ' · səssizlik — avto-dayandı'
       : r.how === 'timeout' ? ' · maksimum müddət doldu' : '';
-    const body = how === 'paste' ? 'kursora yazıldı (Ctrl+V) + clipboard'
+    const body = how === 'paste-restored' ? 'kursora yazıldı (Super+V tarixçəsində də var)'
+      : how === 'paste' ? 'kursora yazıldı (Ctrl+V) + clipboard'
       : how === 'clipboard' ? 'clipboard-a kopyalandı (ydotool işləmədi — Ctrl+V bas)'
       : 'nə clipboard, nə paste işləmədi';
     notify('🎙️ ' + text.slice(0, 60), body + reason, how === false);

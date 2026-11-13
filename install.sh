@@ -51,6 +51,7 @@ echo "→ konfiq (yoxdursa)"
   "maxRecordMs": 120000,
   "silenceRms": 400,
   "tray": true,
+  "restoreClipboard": true,
   "clientVersion": ""
 }
 EOF

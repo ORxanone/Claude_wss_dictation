@@ -2,6 +2,9 @@
 
 > **Bu faylın məqsədi:** yeni agent session-da konteksti bərpa etmək.
 > Yeni session-da de: **"`~/voice-dictate-README.md` faylını oxu — voice-dictate layihəsinə davam edək"**
+>
+> **İki versiya var:** v1 = canlı quruluş (`~/.local/share/voice-dictate`, `Ctrl+Space`, git `main`).
+> v2 = `~/voice-dictate-v2` (git `v2` branch), v1 ilə yan-yana işləyir — bax **§10**.
 
 ---
 
@@ -94,7 +97,7 @@ Ctrl+Space (fiziki)
 7. **ydotool `type` qeyri-ASCII hərfləri ATIR** (ə, ş, ö, ü, ı, ç — US keymap limiti; "Sən→Sn", "yaxşı→yax"). Həll: wl-copy + `ydotool key 29:1 47:1 47:0 29:0` (Ctrl+V paste) — Unicode tam düşür. `type` yalnız fallback; paste-dən əvvəl 200ms gözlə (wl-copy clipboard-u ələ alsın).
 8. **ydotool client socket-i:** default `$XDG_RUNTIME_DIR/.ydotool_socket`; `XDG_RUNTIME_DIR` yoxdursa `/tmp/.ydotool_socket`-a baxır → uğursuz. Daemon child-də env-i tamamla (v2-də `sessionEnv()`).
 9. **ydotool bəzən cavab vermir** → client prosesi əbədi qalır, diktə child-i paste-də ilişir (2026-11-13 real hadisə). Həll (v2): 3s timeout, sonra kill.
-10. **Diktə clipboard-u əvəz edir — istifadəçini çaşdıra bilər:** diktədən sonra Ctrl+V transcript verir, istifadəçi başqa mətn kopyalayana qədər belə. Login kodu kimi vacib kopyalama arxasında diktə bitibsə, kopyalamanın təsdiqini yoxla (`wl-paste`). (2026-11-13: /login kod paste-i köhnə transcript ilə səhv düşdü)
+10. **Diktə clipboard-u əvəz edir — istifadəçini çaşdıra bilər** (v2-də həll: `restoreClipboard`): diktədən sonra Ctrl+V transcript verir, istifadəçi başqa mətn kopyalayana qədər belə. Login kodu kimi vacib kopyalama arxasında diktə bitibsə, kopyalamanın təsdiqini yoxla (`wl-paste`). (2026-11-13: /login kod paste-i köhnə transcript ilə səhv düşdü)
 
 ---
 
@@ -114,6 +117,9 @@ Ctrl+Space (fiziki)
 - ✅ (v2) System tray ikonu (StatusNotifierItem, dbus-next)
 - ✅ (v2) `voice-dictate2 check-endpoint` avtomatik yoxlayır. Claude Code update olarsa endpoint dəyişə bilər → yenidən `grep -aob "speech_to_text"` ilə yoxla (bu README-dəki protokol bölməsi kömək edər)
 - ✅ (v2) `VD_SHORTCUT=... ./install.sh`. Qısayolu dəyişmək istəsə: Shortcuts-də "Voice Dictate Toggle" (KWin script qeydiyyatı) və ya main.js-də keySequence
+11. **Token yarışı:** refresh_token rotasiya olunur. Eyni köhnə refresh_token-i iki proses (Claude Code, Zed claude-acp agentləri, bizim daemon) işlədərsə, biri `invalid_grant` alır → `/login` tələb oluna bilər. v2-də: lock faylı (`~/.cache/voice-dictate2.refresh.lock`), yeniləmədən əvvəl faylı yenidən oxumaq (başqası yeniləyibsə onu işlət), 401-də fayldakı token fərqlidirsə yeniləmədən onu işlət, yazanda ən təzə faylla birləşdir (mcpOAuth itməsin), uğursuzluqda fayldakı tokenə qayıt.
+12. `~/.config/kwinrc`-dəki `voicedictateEnabled=true` girişi KWin tərəfindən silinə bilər — problem deyil, hotkey servisi hər login-də `loadScript`+`start` edir.
+
 - ⬜ **Qeyri-rəsmi istifadədir** — Anthropic ToS riski istifadəçiyə məxsusdur, şəxsi istifadə üçün
 
 ## 8. Test əmrləri
@@ -134,3 +140,42 @@ cat ~/.cache/voice-dictate-hotkey.log
 > **"`~/voice-dictate-README.md` faylını oxu — voice-dictate layihəsinə davam edək"**
 
 Sonra istədiyini əlavə et (tray, dil dəyişmə, wtype, və s.).
+
+---
+
+## 10. v2 (`~/voice-dictate-v2`, git `v2` branch)
+
+v1-in snapşotundan törəyib; v1-ə toxunmur. Quraşdırma: `cd ~/voice-dictate-v2 && ./install.sh` (silmək: `./uninstall.sh`).
+
+| v1 | v2 |
+|---|---|
+| CLI `voice-dictate` | `voice-dictate2` |
+| `~/.local/share/voice-dictate/` | `~/.local/share/voice-dictate2/` |
+| DBus `org.local.VoiceDictate` | `org.local.VoiceDictate2` (+ `/StatusNotifierItem`) |
+| `voice-dictate.service`, `voice-dictate-hotkey.service` | `voice-dictate2.service`, `voice-dictate2-hotkey.service` |
+| KWin script `voicedictate`, `Ctrl+Space` | `voicedictate2`, `Ctrl+Alt+Space` (`VD_SHORTCUT=... ./install.sh`) |
+| `~/.config/voice-dictate.json` | `~/.config/voice-dictate2.json` (yoxdursa v1-inkini oxuyur) |
+| `~/.cache/voice-dictate.state.json` | `~/.cache/voice-dictate2.state.json`, `voice-dictate2-paste.log` |
+
+**v2 konfiqi:** `{"language":"tr","silenceStopMs":15000,"maxRecordMs":120000,"silenceRms":400,"tray":true,"restoreClipboard":true,"clientVersion":""}`
+
+**v2-də nə var:**
+- Tray ikonu (StatusNotifierItem, dbus-next): sol klik başlat/bitir, orta klik ləğv, tooltip-də saniyə. Plasma-da qeydiyyat təsdiqlənib.
+- Səssizlik avto-dayandırma (RMS < `silenceStopMs` müddətində) + `maxRecordMs`; heç səs eşidilməyibsə heç nə yapışdırmır.
+- `voice-dictate2 check-endpoint [versiya]` — bundle-da protokol sətirlərini yoxlayır (2.1.323-də hamısı ✅).
+- UA versiyası `~/.local/share/claude/versions`-dan avtomatik.
+- `sessionEnv()`: XDG_RUNTIME_DIR / WAYLAND_DISPLAY / YDOTOOL_SOCKET avtomatik.
+- ydotool 3s timeout (child ilişmir).
+- `restoreClipboard`: uğurlu paste-dən 1s sonra əvvəlki clipboard mətni qaytarılır; transcript Super+V tarixçəsində qalır. Paste alınmayıbsa transcript clipboard-da qalır.
+- Token yarışına qarşı qoruma (§5 №11).
+
+**Hələ real mikrofonla test olunmayıb:** səssizlik avto-dayandırma, avtomatik paste, clipboard bərpası (v2 quraşdırılmalıdır).
+
+**v2 test əmrləri:**
+```bash
+voice-dictate2 test 10
+voice-dictate2 check-endpoint
+systemctl --user status voice-dictate2 voice-dictate2-hotkey
+qdbus6 org.kde.StatusNotifierWatcher /StatusNotifierWatcher org.kde.StatusNotifierWatcher.RegisteredStatusNotifierItems
+cat ~/.cache/voice-dictate2-paste.log ~/.cache/voice-dictate2-hotkey.log
+```
