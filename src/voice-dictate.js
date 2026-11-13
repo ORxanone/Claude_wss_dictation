@@ -364,11 +364,18 @@ async function pasteText(text) {
       { stdio: ['ignore', 'ignore', 'pipe'], env });
     let err = '';
     y.stderr.on('data', (d) => { err += d; });
-    y.once('error', (e) => { pasteLog('ydotool spawn xəta: ' + e.message); resolve(false); });
+    // ydotoold cavab verməzsə proses əbədi ilişir — 3s sonra öldür (v1-də olan bug)
+    const killer = setTimeout(() => {
+      pasteLog('ydotool 3s cavab vermədi — öldürüldü');
+      try { y.kill('SIGKILL'); } catch {}
+      resolve(false);
+    }, 3000);
+    const done = (ok) => { clearTimeout(killer); resolve(ok); };
+    y.once('error', (e) => { clearTimeout(killer); pasteLog('ydotool spawn xəta: ' + e.message); resolve(false); });
     y.once('exit', (code) => {
       pasteLog(`ydotool key exit=${code}${err ? ' stderr: ' + err.trim() : ''}` +
         ` wayland=${env.WAYLAND_DISPLAY || '-'} socket=${env.YDOTOOL_SOCKET || '-'}`);
-      resolve(code === 0);
+      done(code === 0);
     });
   });
   return pasted ? 'paste' : (copied ? 'clipboard' : false);
