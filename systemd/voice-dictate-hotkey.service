@@ -1,8 +1,0 @@
-[Unit]
-Description=Load voice-dictate KWin hotkey script
-After=graphical-session.target
-[Service]
-Type=oneshot
-ExecStart=/home/patriot/.local/bin/voice-dictate-hotkey-load.sh
-[Install]
-WantedBy=graphical-session.target

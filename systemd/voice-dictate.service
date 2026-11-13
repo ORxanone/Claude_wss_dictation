@@ -1,9 +1,0 @@
-[Unit]
-Description=Voice dictate (Anthropic STT) DBus listener
-[Service]
-Type=simple
-ExecStart=/home/patriot/.nvm/versions/node/v24.18.0/bin/node /home/patriot/.local/share/voice-dictate/voice-dictate.js listen
-Restart=on-failure
-RestartSec=2
-[Install]
-WantedBy=default.target

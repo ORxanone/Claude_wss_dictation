@@ -1,7 +1,14 @@
 #!/usr/bin/env node
 /*
- * voice-dictate — Anthropic-in diktə sistemindən (Claude Code-la eyni endpoint)
+ * voice-dictate2 — Anthropic-in diktə sistemindən (Claude Code-la eyni endpoint)
  * istənilən yerdə istifadə: qısayol → danış → mətn kursora + clipboard-a.
+ *
+ * v2 (ayrıca layihə, v1 ilə yan-yana işləyir — adlar fərqlidir):
+ *   - System tray ikonu (StatusNotifierItem): sol klik = başlat/dayandır, orta klik = ləğv
+ *   - Səssizlik avto-dayandırma (silenceStopMs) + maksimum müddət (maxRecordMs)
+ *   - check-endpoint: Claude Code yenilənəndə protokolun dəyişib-dəyişmədiyini yoxlayır
+ *   - User-Agent versiyası quraşdırılmış Claude Code-dan avtomatik götürülür
+ *   - ydotool socket-i env-dən asılı olmadan tapılır
  *
  * Protokol (Claude Code 2.1.322 bundle-ından çıxarıldı):
  *   wss://api.anthropic.com/api/ws/speech_to_text/voice_stream
@@ -14,7 +21,7 @@
  *   Gələn: {"type":"TranscriptInterim"|"TranscriptText","data":...},
  *          {"type":"TranscriptEndpoint"}, {"type":"TranscriptError",...}
  *
- * Komandalar: start | stop | toggle | cancel | test <san> | status
+ * Komandalar: start | stop | toggle | cancel | status | test <san> | check-endpoint | listen
  */
 'use strict';
 
@@ -24,34 +31,74 @@ const os = require('os');
 const path = require('path');
 const WebSocket = require('ws');
 
-const CFG_PATH = path.join(os.homedir(), '.config', 'voice-dictate.json');
-const CRED_PATH = path.join(os.homedir(), '.claude', '.credentials.json');
-const STATE_PATH = path.join(os.homedir(), '.cache', 'voice-dictate.state.json');
+// ---------- adlar (v1 ilə toqquşmasın) ----------
+const APP = 'voice-dictate2';
+const DBUS_NAME = 'org.local.VoiceDictate2';
+const DBUS_PATH = '/org/local/VoiceDictate2';
+
+const HOME = os.homedir();
+const CFG_PATH = path.join(HOME, '.config', APP + '.json');
+const CFG_FALLBACK = path.join(HOME, '.config', 'voice-dictate.json'); // v1 konfiqi
+const CRED_PATH = path.join(HOME, '.claude', '.credentials.json');
+const STATE_PATH = path.join(HOME, '.cache', APP + '.state.json');
+const PASTE_LOG = path.join(HOME, '.cache', APP + '-paste.log');
+const CLAUDE_VERSIONS = path.join(HOME, '.local', 'share', 'claude', 'versions');
+
 const WS_BASE = 'wss://api.anthropic.com/api/ws/speech_to_text/voice_stream';
 const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_SCOPE = 'user:profile user:inference user:sessions:claude_code ' +
   'user:mcp_servers user:file_upload user:plugins';
-const UA = 'claude-cli/2.1.322 (external, cli)';
+const KNOWN_GOOD_VERSION = '2.1.322';
 const KEEPALIVE_MS = 5000;
-const MAX_RECORD_MS = 120000;
 const FINALIZE_TIMEOUT_MS = 6000;
 const MIN_BYTES = 8000; // ~0.25 saniyə səs
 
+const DEFAULTS = {
+  language: 'tr',          // az server tərəfindən dəstəklənmir; tr azərbaycanca yaxşı yazır
+  silenceStopMs: 15000,    // bu qədər səssizlikdən sonra avtomatik dayandır (0 = söndür)
+  maxRecordMs: 120000,     // maksimum yazma müddəti
+  silenceRms: 400,         // bu RMS-dən aşağı = səssizlik (s16, 0..32767)
+  tray: true,              // system tray ikonu
+  clientVersion: '',       // boş = Claude Code versiyası avtomatik
+};
+
 function cfg() {
-  try { return JSON.parse(fs.readFileSync(CFG_PATH, 'utf8')); } catch { return {}; }
+  let user = {};
+  for (const p of [CFG_PATH, CFG_FALLBACK]) {
+    try { user = JSON.parse(fs.readFileSync(p, 'utf8')); break; } catch {}
+  }
+  return { ...DEFAULTS, ...user };
 }
-function saveCfg(c) {
-  try { fs.writeFileSync(CFG_PATH, JSON.stringify(c, null, 2)); } catch {}
-}
-function log(...a) { console.log('[voice-dictate]', ...a); }
+function log(...a) { console.log('[' + APP + ']', ...a); }
 
 function notify(summary, body, urgent) {
   try {
-    spawn('notify-send', ['-a', 'voice-dictate',
+    spawn('notify-send', ['-a', APP,
       ...(urgent ? ['-u', 'critical'] : ['-u', 'normal']),
       summary, body || ''], { detached: true, stdio: 'ignore' }).unref();
   } catch {}
+}
+
+// ---------- Claude Code versiyası ----------
+function cmpVer(a, b) {
+  const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+function latestClaudeVersion() {
+  try {
+    const vs = fs.readdirSync(CLAUDE_VERSIONS).filter((v) => /^\d+(\.\d+)*$/.test(v));
+    vs.sort(cmpVer);
+    return vs[vs.length - 1] || null;
+  } catch { return null; }
+}
+function userAgent() {
+  const v = cfg().clientVersion || latestClaudeVersion() || KNOWN_GOOD_VERSION;
+  return `claude-cli/${v} (external, cli)`;
 }
 
 // ---------- token ----------
@@ -72,7 +119,7 @@ async function ensureAccessToken(force) {
   try {
     const res = await fetch(OAUTH_TOKEN_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': UA },
+      headers: { 'Content-Type': 'application/json', 'User-Agent': userAgent() },
       body: JSON.stringify({
         grant_type: 'refresh_token',
         refresh_token: oauth.refreshToken,
@@ -86,7 +133,7 @@ async function ensureAccessToken(force) {
     if (j.refresh_token) oauth.refreshToken = j.refresh_token;
     oauth.expiresAt = Date.now() + (j.expires_in || 3600) * 1000;
     file.claudeAiOauth = oauth;
-    const tmp = CRED_PATH + '.tmp';
+    const tmp = CRED_PATH + '.' + process.pid + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(file, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, CRED_PATH);
     log('token yeniləndi');
@@ -105,23 +152,27 @@ function startRecorder() {
   child.once('error', () => {
     if (failed) return;
     failed = true;
-    // fallback: ffmpeg (pulse vasitəsilə pipewire)
     child = spawn('ffmpeg', ['-f', 'pulse', '-i', 'default',
       '-ar', '16000', '-ac', '1', '-f', 's16le', '-'],
       { stdio: ['ignore', 'pipe', 'ignore'] });
-    hook(child);
+    child.once('error', () => {});
   });
-  function hook(c) {
-    c.once('error', () => { failed = true; });
-  }
-  hook(child);
   return child;
+}
+
+// s16le chunk-ın RMS-i
+function rms(buf) {
+  const n = Math.floor(buf.length / 2);
+  if (!n) return 0;
+  let sum = 0;
+  for (let i = 0; i < n; i++) { const s = buf.readInt16LE(i * 2); sum += s * s; }
+  return Math.sqrt(sum / n);
 }
 
 // ---------- əsas: yaz + transkripsiya ----------
 async function recordAndTranscribe(opts, onChunk, allowRetry = true) {
   const c = cfg();
-  const language = process.env.VD_LANG || c.language || 'tr';
+  const language = process.env.VD_LANG || c.language;
   const token = await ensureAccessToken();
 
   const params = new URLSearchParams({
@@ -133,34 +184,36 @@ async function recordAndTranscribe(opts, onChunk, allowRetry = true) {
     language,
     use_conversation_engine: 'true',
   });
-  const url = `${WS_BASE}?${params}`;
 
-  const ws = new WebSocket(url, {
+  const ws = new WebSocket(`${WS_BASE}?${params}`, {
     headers: {
       'Authorization': `Bearer ${token}`,
-      'User-Agent': UA,
+      'User-Agent': userAgent(),
       'x-app': 'cli',
       'anthropic-client-platform': 'Linux',
     },
     handshakeTimeout: 10000,
   });
 
-  let openError = null;
-  await new Promise((resolve, reject) => {
-    ws.once('open', resolve);
-    ws.once('error', (e) => { openError = e; reject(e); });
-    ws.once('unexpected-response', (req, res) => {
-      openError = new Error(`WS rədd edildi: HTTP ${res.statusCode}` +
-        (res.headers['cf-mitigated'] ? ' (Cloudflare)' : ''));
-      openError.statusCode = res.statusCode;
-      reject(openError);
+  try {
+    await new Promise((resolve, reject) => {
+      ws.once('open', resolve);
+      ws.once('error', reject);
+      ws.once('unexpected-response', (req, res) => {
+        const e = new Error(`WS rədd edildi: HTTP ${res.statusCode}` +
+          (res.headers['cf-mitigated'] ? ' (Cloudflare)' : ''));
+        e.statusCode = res.statusCode;
+        reject(e);
+      });
     });
-  });
-  // 401 → məcburi token yenilə, bir dəfə cəhd et
-  if (openError && openError.statusCode === 401 && allowRetry) {
-    log('401: token yenilənir və yenidən qoşulur...');
-    await ensureAccessToken(true);
-    return recordAndTranscribe(opts, onChunk, false);
+  } catch (e) {
+    // 401 → məcburi token yenilə, bir dəfə cəhd et
+    if (e.statusCode === 401 && allowRetry) {
+      log('401: token yenilənir və yenidən qoşulur...');
+      await ensureAccessToken(true);
+      return recordAndTranscribe(opts, onChunk, false);
+    }
+    throw e;
   }
 
   ws.send(JSON.stringify({ type: 'KeepAlive' }));
@@ -174,6 +227,7 @@ async function recordAndTranscribe(opts, onChunk, allowRetry = true) {
   const finalPromise = new Promise((resolve, reject) => {
     finalResolve = resolve; finalReject = reject;
   });
+  finalPromise.catch(() => {});
   ws.on('message', (data, isBinary) => {
     if (isBinary) return;
     let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
@@ -182,11 +236,10 @@ async function recordAndTranscribe(opts, onChunk, allowRetry = true) {
       case 'TranscriptText':
         if (msg.data) { latest = msg.data; if (onChunk) onChunk(latest); }
         break;
-      case 'TranscriptEndpoint': {
+      case 'TranscriptEndpoint':
         if (finalized) break; finalized = true;
         finalResolve(latest);
         break;
-      }
       case 'TranscriptError':
         if (finalized) break; finalized = true;
         finalReject(new Error(msg.description || msg.error_code || 'transkripsiya xətası'));
@@ -203,93 +256,109 @@ async function recordAndTranscribe(opts, onChunk, allowRetry = true) {
   });
   ws.on('error', () => {});
 
-  // mikrofon
+  // mikrofon + səssizlik aşkarlama
   const rec = startRecorder();
   let bytes = 0;
+  const startedAt = Date.now();
+  let lastVoiceAt = startedAt;
+  let heardVoice = false;
   rec.stdout.on('data', (chunk) => {
     bytes += chunk.length;
+    if (rms(chunk) >= c.silenceRms) { lastVoiceAt = Date.now(); heardVoice = true; }
     if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
   });
   rec.once('error', () => {});
-  rec.once('exit', () => {}); // stop-da biz öldürürük
 
-  const stopSignal = () => new Promise((resolve) => {
-    process.on('SIGUSR2', () => resolve('stop'));
-    process.on('SIGTERM', () => resolve('cancel'));
-    process.on('SIGINT', () => resolve('cancel'));
+  const maxMs = opts.seconds ? opts.seconds * 1000 : c.maxRecordMs;
+  let watch;
+  const how = await new Promise((resolve) => {
+    process.once('SIGUSR2', () => resolve('stop'));
+    process.once('SIGTERM', () => resolve('cancel'));
+    process.once('SIGINT', () => resolve('cancel'));
+    watch = setInterval(() => {
+      const now = Date.now();
+      if (now - startedAt >= maxMs) resolve('timeout');
+      else if (!opts.seconds && c.silenceStopMs > 0 && now - lastVoiceAt >= c.silenceStopMs)
+        resolve('silence');
+    }, 250);
   });
-
-  const timeout = new Promise((res) =>
-    setTimeout(() => res('timeout'), opts.seconds ? opts.seconds * 1000 : MAX_RECORD_MS));
-
-  const how = await Promise.race([stopSignal(), timeout]);
+  clearInterval(watch);
   clearInterval(ka);
-
-  if (rec && !rec.killed) { try { rec.kill('SIGKILL'); } catch {} }
+  try { rec.kill('SIGKILL'); } catch {}
 
   if (how === 'cancel') {
-    try { if (ws.readyState === WebSocket.OPEN) ws.close(); } catch {}
-    finalReject = finalReject || (() => {});
+    try { ws.close(); } catch {}
     return { cancelled: true };
   }
-
-  // finalize: CloseStream göndər, son nəticəni gözlə
+  if (how === 'silence' && !heardVoice && !latest) {
+    try { ws.close(); } catch {}
+    throw new Error(`${Math.round(c.silenceStopMs / 1000)}s səs eşidilmədi — dayandırıldı`);
+  }
   if (bytes < MIN_BYTES) {
     try { ws.close(); } catch {}
     throw new Error('səs yazılmadı (çox qısa və ya mikrofon səssiz)');
   }
+
+  // finalize: CloseStream göndər, son nəticəni gözlə
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'CloseStream' }));
   let transcript;
   try {
     transcript = await Promise.race([
       finalPromise,
-      new Promise((_, rej) => setTimeout(() =>
-        rej(new Error(latest ? 'finalize timeout (interim saxlanıldı)' : 'finalize timeout')), FINALIZE_TIMEOUT_MS)),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('finalize timeout')), FINALIZE_TIMEOUT_MS)),
     ]);
   } catch (e) {
     if (latest) transcript = latest; // interim-i son nəticə kimi işlət
     else throw e;
   }
   try { ws.close(); } catch {}
-  return { cancelled: false, transcript, bytes };
+  return { cancelled: false, transcript, bytes, how };
 }
 
 // ---------- paste ----------
-// Daemon systemd-də qalxanda WAYLAND_DISPLAY olmaya bilər (Plazma sonra set edir).
-// XDG_RUNTIME_DIR-də wayland-* socket-i axtarıb env-i tamamlayırıq.
-const PASTE_LOG = path.join(os.homedir(), '.cache', 'voice-dictate-paste.log');
 function pasteLog(msg) {
   try { fs.appendFileSync(PASTE_LOG, new Date().toISOString() + ' ' + msg + '\n'); } catch {}
 }
-function waylandEnv() {
+
+// Daemon systemd-də qalxanda WAYLAND_DISPLAY / XDG_RUNTIME_DIR olmaya bilər.
+// Hər ikisini, həmçinin ydotool socket-ini özümüz tapırıq.
+function sessionEnv() {
   const env = { ...process.env };
+  if (!env.XDG_RUNTIME_DIR) {
+    const d = `/run/user/${process.getuid()}`;
+    if (fs.existsSync(d)) env.XDG_RUNTIME_DIR = d;
+  }
   if (!env.WAYLAND_DISPLAY && env.XDG_RUNTIME_DIR) {
     try {
       const sock = fs.readdirSync(env.XDG_RUNTIME_DIR)
-        .find((f) => f.startsWith('wayland-') && !f.endsWith('.lock'));
+        .find((f) => /^wayland-\d+$/.test(f));
       if (sock) env.WAYLAND_DISPLAY = sock;
     } catch {}
+  }
+  if (!env.YDOTOOL_SOCKET && env.XDG_RUNTIME_DIR) {
+    const s = path.join(env.XDG_RUNTIME_DIR, '.ydotool_socket');
+    if (fs.existsSync(s)) env.YDOTOOL_SOCKET = s;
   }
   return env;
 }
 
-async function pasteText(text) {
-  const env = waylandEnv();
-  let copied = false;
-  // həmişə clipboard-a (wl-copy prosesi clipboard sahibi kimi canlı qalmalıdır)
+function copyToClipboard(text, env) {
   try {
-    const wl = spawn('wl-copy', [], {
-      detached: true, stdio: ['pipe', 'ignore', 'ignore'], env,
-    });
+    const wl = spawn('wl-copy', [], { detached: true, stdio: ['pipe', 'ignore', 'ignore'], env });
+    wl.once('error', () => {});
     wl.stdin.end(text);
     wl.unref();
-    wl.once('error', () => {});
-    copied = true;
-  } catch {}
-  // paste-ə qədər wl-copy-nin clipboard-u ələ almasına vaxt ver
+    return true;
+  } catch { return false; }
+}
+
+async function pasteText(text) {
+  const env = sessionEnv();
+  const copied = copyToClipboard(text, env);
+  // paste-dən əvvəl wl-copy clipboard-u ələ alsın
   if (copied) await new Promise((r) => setTimeout(r, 200));
-  // Ctrl+V paste (ydotool uinput) — Unicode hərflər (ə, ş, ö...) belə düşür.
-  // ydotool type US keymap-dan kənar simvolları ATIR, ona görə paste birinci yoldur.
+  // Ctrl+V (ydotool uinput) — Unicode hərflər (ə, ş, ö...) tam düşür.
+  // ydotool `type` US keymap-dan kənar simvolları ATIR, ona görə istifadə olunmur.
   const pasted = await new Promise((resolve) => {
     const y = spawn('ydotool', ['key', '--key-delay', '60', '29:1', '47:1', '47:0', '29:0'],
       { stdio: ['ignore', 'ignore', 'pipe'], env });
@@ -297,7 +366,8 @@ async function pasteText(text) {
     y.stderr.on('data', (d) => { err += d; });
     y.once('error', (e) => { pasteLog('ydotool spawn xəta: ' + e.message); resolve(false); });
     y.once('exit', (code) => {
-      pasteLog(`ydotool key exit=${code}${err ? ' stderr: ' + err.trim() : ''} wayland=${env.WAYLAND_DISPLAY || '-'} xdg=${env.XDG_RUNTIME_DIR ? 'var' : 'yox'}`);
+      pasteLog(`ydotool key exit=${code}${err ? ' stderr: ' + err.trim() : ''}` +
+        ` wayland=${env.WAYLAND_DISPLAY || '-'} socket=${env.YDOTOOL_SOCKET || '-'}`);
       resolve(code === 0);
     });
   });
@@ -317,33 +387,27 @@ function clearState() { try { fs.unlinkSync(STATE_PATH); } catch {} }
 
 // ---------- rejimlər ----------
 function childMain() {
-  const isTest = process.env.VD_TEST === '1';
-  const seconds = parseInt(process.env.VD_SECONDS || '0', 10) || 0;
   fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
   fs.writeFileSync(STATE_PATH, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
-  notify('🎙️ Dinləyir...', isTest ? `test: ${seconds}s` : 'bitirmək üçün qısayola bir dəfə daha bas');
+  const c = cfg();
+  notify('🎙️ Dinləyir...', 'bitirmək üçün qısayola bir dəfə daha bas' +
+    (c.silenceStopMs > 0 ? ` (${Math.round(c.silenceStopMs / 1000)}s səssizlikdə avtomatik dayanır)` : ''));
 
-  recordAndTranscribe({}, null).then((r) => {
+  recordAndTranscribe({}, null).then(async (r) => {
     clearState();
-    if (!r) return;
     if (r.cancelled) { notify('🎙️ Ləğv olundu', ''); return; }
     const text = (r.transcript || '').trim();
     if (!text) { notify('🎙️ Mətn tapılmadı', 'yenidən cəhd et', true); return; }
-    if (isTest) {
-      process.stdout.write(text + '\n');
-      notify('🎙️ ' + text.slice(0, 60), 'clipboard-a kopyalandı');
-      return;
-    }
-    pasteText(text).then((how) => {
-      const body = how === 'paste' ? 'kursora yazıldı (Ctrl+V) + clipboard'
-        : how === 'clipboard' ? 'clipboard-a kopyalandı (ydotool işləmədi — Ctrl+V bas)'
-        : 'nə clipboard, nə paste işləmədi';
-      notify('🎙️ ' + text.slice(0, 60), body, how === false);
-    });
+    const how = await pasteText(text);
+    const reason = r.how === 'silence' ? ' · səssizlik — avto-dayandı'
+      : r.how === 'timeout' ? ' · maksimum müddət doldu' : '';
+    const body = how === 'paste' ? 'kursora yazıldı (Ctrl+V) + clipboard'
+      : how === 'clipboard' ? 'clipboard-a kopyalandı (ydotool işləmədi — Ctrl+V bas)'
+      : 'nə clipboard, nə paste işləmədi';
+    notify('🎙️ ' + text.slice(0, 60), body + reason, how === false);
   }).catch((e) => {
     clearState();
     notify('🎙️ Xəta', String(e.message || e), true);
-    if (isTest) { console.error('ERROR: ' + (e.message || e)); process.exitCode = 1; }
   });
 }
 
@@ -353,18 +417,15 @@ async function parentMain(cmd, args) {
     case 'toggle': {
       if (stateAlive()) {
         if (cmd === 'toggle') {
-          const s = readState();
-          try { process.kill(s.pid, 'SIGUSR2'); } catch {}
+          try { process.kill(readState().pid, 'SIGUSR2'); } catch {}
           log('yazma dayandırılır...');
         } else notify('🎙️ Artıq yazırsan', '');
         return;
       }
       const child = spawn(process.execPath, [__filename, '_child'], {
-        detached: true, stdio: 'ignore',
-        env: { ...process.env, VD_TEST: '0' },
+        detached: true, stdio: 'ignore', env: process.env,
       });
       child.unref();
-      // state faylının gəlməsini gözlə
       for (let i = 0; i < 30; i++) {
         await new Promise((r) => setTimeout(r, 100));
         if (readState()) break;
@@ -374,7 +435,7 @@ async function parentMain(cmd, args) {
     }
     case 'stop': {
       const s = readState();
-      if (s) { try { process.kill(s.pid, 'SIGUSR2'); } catch {} clearState(); }
+      if (s) { try { process.kill(s.pid, 'SIGUSR2'); } catch {} }
       else log('aktiv yazma yoxdur');
       break;
     }
@@ -389,23 +450,22 @@ async function parentMain(cmd, args) {
     }
     case 'test': {
       const seconds = parseInt(args[0] || '6', 10);
-      const token = await ensureAccessToken().catch(() => null);
-      if (!token) { console.error('token yoxdur'); process.exit(1); }
-      console.error(`TEST: ${seconds} san danış...`);
+      console.error(`TEST: ${seconds} san danış... (UA: ${userAgent()})`);
       try {
-        const r = await recordAndTranscribe({ seconds }, null);
+        const r = await recordAndTranscribe({ seconds }, (t) => process.stderr.write('\r… ' + t.slice(-70)));
+        process.stderr.write('\n');
         if (r.cancelled) { console.log('(ləğv)'); return; }
         console.log('TRANSCRIPT: ' + (r.transcript || '(boş)'));
-        try {
-          const wl = spawn('wl-copy', [], { stdio: ['pipe', 'ignore', 'ignore'], env: waylandEnv() });
-          wl.stdin.end((r.transcript || '').trim());
-        } catch {}
+        copyToClipboard((r.transcript || '').trim(), sessionEnv());
       } catch (e) {
         console.error('XƏTA: ' + (e.message || e));
         process.exitCode = 1;
       }
       break;
     }
+    case 'check-endpoint':
+      process.exitCode = checkEndpoint(args[0]);
+      break;
     case '_child':
       childMain();
       break;
@@ -413,17 +473,56 @@ async function parentMain(cmd, args) {
       listenMain();
       break;
     default:
-      console.log('istifadə: voice-dictate start|stop|toggle|cancel|status|test [san]');
+      console.log(`istifadə: ${APP} start|stop|toggle|cancel|status|test [san]|check-endpoint [versiya]|listen`);
   }
 }
 
+// ---------- check-endpoint ----------
+// Claude Code yenilənəndə bundle-da protokol sətirlərinin hələ də olduğunu yoxlayır.
+function checkEndpoint(version) {
+  const v = version || latestClaudeVersion();
+  if (!v) { console.error('Claude Code versiyası tapılmadı: ' + CLAUDE_VERSIONS); return 2; }
+  const file = path.join(CLAUDE_VERSIONS, v);
+  console.log(`Bundle: ${file}` + (v === KNOWN_GOOD_VERSION ? ' (yoxlanılmış versiya)' : ` (yoxlanılmış: ${KNOWN_GOOD_VERSION})`));
+  let buf;
+  try { buf = fs.readFileSync(file); } catch (e) { console.error('oxunmadı: ' + e.message); return 2; }
+  const checks = [
+    ['WS endpoint yolu', '/api/ws/speech_to_text/voice_stream'],
+    ['OAuth token URL', 'platform.claude.com/v1/oauth/token'],
+    ['OAuth client_id', OAUTH_CLIENT_ID],
+    ['param endpointing_ms', 'endpointing_ms'],
+    ['param utterance_end_ms', 'utterance_end_ms'],
+    ['param use_conversation_engine', 'use_conversation_engine'],
+    ['mesaj KeepAlive', 'KeepAlive'],
+    ['mesaj CloseStream', 'CloseStream'],
+    ['mesaj TranscriptText', 'TranscriptText'],
+    ['mesaj TranscriptInterim', 'TranscriptInterim'],
+    ['mesaj TranscriptEndpoint', 'TranscriptEndpoint'],
+  ];
+  let bad = 0;
+  for (const [label, needle] of checks) {
+    const ok = buf.indexOf(needle) !== -1;
+    if (!ok) bad++;
+    console.log(`${ok ? '✅' : '❌'} ${label.padEnd(30)} ${needle}`);
+  }
+  // speech_to_text ətrafındakı kontekst (dəyişiklik varsa əl ilə baxmaq üçün)
+  const i = buf.indexOf('speech_to_text');
+  if (i !== -1) {
+    const ctx = buf.subarray(Math.max(0, i - 120), i + 200).toString('latin1').replace(/[^\x20-\x7e]/g, '.');
+    console.log('\nKontekst:\n' + ctx);
+  }
+  console.log(bad ? `\n⚠️  ${bad} sətir tapılmadı — protokol dəyişmiş ola bilər.` : '\nHər şey yerindədir.');
+  return bad ? 1 : 0;
+}
+
+// ---------- daemon: DBus + tray ----------
 function listenMain() {
   const dbus = require('dbus-next');
+  const { Interface } = dbus.interface;
   const bus = dbus.sessionBus();
-  const name = 'org.local.VoiceDictate';
 
-  class VoiceDictateIface extends dbus.interface.Interface {
-    constructor() { super('org.local.VoiceDictate'); }
+  class VoiceDictateIface extends Interface {
+    constructor() { super(DBUS_NAME); }
     Toggle() { parentMain('toggle').catch(() => {}); }
     Cancel() { parentMain('cancel').catch(() => {}); }
   }
@@ -434,13 +533,118 @@ function listenMain() {
     },
   });
 
-  bus.requestName(name, 0).then(() => {
-    bus.export('/org/local/VoiceDictate', new VoiceDictateIface());
-    log('DBus dinləyici hazır (' + name + ')');
+  bus.requestName(DBUS_NAME, 0).then(() => {
+    bus.export(DBUS_PATH, new VoiceDictateIface());
+    log('DBus dinləyici hazır (' + DBUS_NAME + ')');
+    if (cfg().tray) startTray(bus, dbus).catch((e) => log('tray xətası: ' + e.message));
   }).catch((e) => {
     console.error('DBus:', e.message);
     process.exit(1);
   });
+}
+
+// StatusNotifierItem (KDE Plasma system tray)
+async function startTray(bus, dbus) {
+  const { Interface, ACCESS_READ } = dbus.interface;
+  const { Variant } = dbus;
+  const ICON_IDLE = 'audio-input-microphone';
+  const ICON_REC = 'media-record';
+
+  let recording = false;
+  let since = 0;
+
+  class SNI extends Interface {
+    constructor() { super('org.kde.StatusNotifierItem'); }
+    get Category() { return 'ApplicationStatus'; }
+    get Id() { return APP; }
+    get Title() { return 'Voice Dictate v2'; }
+    get Status() { return recording ? 'NeedsAttention' : 'Active'; }
+    get WindowId() { return 0; }
+    get IconName() { return recording ? ICON_REC : ICON_IDLE; }
+    get AttentionIconName() { return ICON_REC; }
+    get OverlayIconName() { return ''; }
+    get IconThemePath() { return ''; }
+    get ItemIsMenu() { return false; }
+    get Menu() { return '/NO_DBUSMENU'; }
+    get ToolTip() {
+      const sub = recording
+        ? `Yazır… ${Math.round((Date.now() - since) / 1000)}s — sol klik: bitir, orta klik: ləğv`
+        : 'Boşta — sol klik: başlat';
+      return ['', [], 'Voice Dictate v2', sub];
+    }
+    Activate(x, y) { parentMain('toggle').catch(() => {}); }
+    SecondaryActivate(x, y) { parentMain('cancel').catch(() => {}); }
+    ContextMenu(x, y) { parentMain('toggle').catch(() => {}); }
+    Scroll(delta, orientation) {}
+    NewIcon() {}
+    NewAttentionIcon() {}
+    NewToolTip() {}
+    NewStatus(s) { return s; }
+  }
+  const R = { signature: '', access: ACCESS_READ };
+  SNI.configureMembers({
+    properties: {
+      Category: { ...R, signature: 's' }, Id: { ...R, signature: 's' },
+      Title: { ...R, signature: 's' }, Status: { ...R, signature: 's' },
+      WindowId: { ...R, signature: 'i' }, IconName: { ...R, signature: 's' },
+      AttentionIconName: { ...R, signature: 's' }, OverlayIconName: { ...R, signature: 's' },
+      IconThemePath: { ...R, signature: 's' }, ItemIsMenu: { ...R, signature: 'b' },
+      Menu: { ...R, signature: 'o' }, ToolTip: { ...R, signature: '(sa(iiay)ss)' },
+    },
+    methods: {
+      Activate: { inSignature: 'ii' },
+      SecondaryActivate: { inSignature: 'ii' },
+      ContextMenu: { inSignature: 'ii' },
+      Scroll: { inSignature: 'is' },
+    },
+    signals: {
+      NewIcon: {}, NewAttentionIcon: {}, NewToolTip: {},
+      NewStatus: { signature: 's' },
+    },
+  });
+
+  const sni = new SNI();
+  bus.export('/StatusNotifierItem', sni);
+
+  async function register() {
+    try {
+      const obj = await bus.getProxyObject('org.kde.StatusNotifierWatcher', '/StatusNotifierWatcher');
+      await obj.getInterface('org.kde.StatusNotifierWatcher').RegisterStatusNotifierItem(DBUS_NAME);
+      log('tray ikonu qeydiyyatdan keçdi');
+      return true;
+    } catch (e) {
+      log('tray qeydiyyatı alınmadı (' + e.message + '), təkrar cəhd ediləcək');
+      return false;
+    }
+  }
+
+  // Watcher (plasmashell) hələ qalxmayıbsa / restart olarsa yenidən qeydiyyat
+  (async () => {
+    for (let i = 0; i < 60; i++) {
+      if (await register()) break;
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  })();
+  try {
+    const dobj = await bus.getProxyObject('org.freedesktop.DBus', '/org/freedesktop/DBus');
+    dobj.getInterface('org.freedesktop.DBus').on('NameOwnerChanged', (name, oldO, newO) => {
+      if (name === 'org.kde.StatusNotifierWatcher' && newO) setTimeout(register, 500);
+    });
+  } catch {}
+
+  // state faylını izlə → ikonu yenilə
+  setInterval(() => {
+    const now = stateAlive();
+    if (now !== recording) {
+      recording = now;
+      since = now ? ((readState() || {}).startedAt || Date.now()) : 0;
+      sni.NewIcon();
+      sni.NewStatus(sni.Status);
+      sni.NewToolTip();
+    } else if (recording) {
+      sni.NewToolTip(); // saniyə sayğacı
+    }
+  }, 500);
 }
 
 const [, , cmd = 'toggle', ...rest] = process.argv;

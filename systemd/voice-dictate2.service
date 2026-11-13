@@ -1,0 +1,11 @@
+[Unit]
+Description=Voice dictate v2 (Anthropic STT) DBus listener + tray
+After=graphical-session.target
+PartOf=graphical-session.target
+[Service]
+Type=simple
+ExecStart=__NODE__ __SHARE__/voice-dictate.js listen
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=graphical-session.target

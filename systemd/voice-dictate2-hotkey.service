@@ -1,0 +1,8 @@
+[Unit]
+Description=Load voice-dictate2 KWin hotkey script
+After=graphical-session.target
+[Service]
+Type=oneshot
+ExecStart=__BIN__/voice-dictate2-hotkey-load.sh
+[Install]
+WantedBy=graphical-session.target

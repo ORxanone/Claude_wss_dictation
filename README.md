@@ -1,4 +1,18 @@
-# voice-dictate (Claude_wss_dictation)
+# voice-dictate2 (Claude_wss_dictation — v2 branch)
+
+> **v2** — v1 ilə yan-yana işləyən ayrıca versiya: CLI `voice-dictate2`, DBus `org.local.VoiceDictate2`,
+> servis `voice-dictate2.service`, KWin script `voicedictate2`, default qısayol **`Ctrl+Alt+Space`**.
+>
+> **v2-də yeni:**
+> - System tray ikonu — sol klik: başlat/bitir, orta klik: ləğv, tooltip-də saniyə sayğacı
+> - Səssizlik avto-dayandırma (`silenceStopMs`, default 15s) + maksimum müddət (`maxRecordMs`, 120s)
+> - `voice-dictate2 check-endpoint` — Claude Code yenilənəndə protokolun yerində olduğunu yoxlayır
+> - User-Agent versiyası quraşdırılmış Claude Code-dan avtomatik götürülür
+> - ydotool socket / WAYLAND_DISPLAY / XDG_RUNTIME_DIR env-dən asılı olmadan tapılır
+> - Qısayol quraşdırmada dəyişdirilə bilər: `VD_SHORTCUT="Meta+H" ./install.sh`; `uninstall.sh`
+>
+> Konfiq `~/.config/voice-dictate2.json`:
+> `{"language":"tr","silenceStopMs":15000,"maxRecordMs":120000,"silenceRms":400,"tray":true,"clientVersion":""}`
 
 **İstənilən proqramda `Ctrl+Space` → danış → mətn birbaşa kursorun yerinə düşür.**
 

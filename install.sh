@@ -1,72 +1,66 @@
 #!/bin/sh
-# voice-dictate quraşdırma (Arch Linux / KDE Plasma Wayland / PipeWire)
+# voice-dictate2 quraşdırma (Arch Linux / KDE Plasma 6 Wayland / PipeWire)
+# v1 (voice-dictate) ilə yan-yana işləyir — bütün adlar fərqlidir.
+#   VD_SHORTCUT="Meta+H" ./install.sh     # qısayolu dəyiş (default Ctrl+Alt+Space)
 set -e
 REPO="$(cd "$(dirname "$0")" && pwd)"
-SHARE="$HOME/.local/share/voice-dictate"
+SHARE="$HOME/.local/share/voice-dictate2"
+BIN="$HOME/.local/bin"
+UNITS="$HOME/.config/systemd/user"
+KWIN="$HOME/.local/share/kwin/scripts/voicedictate2"
 NODE="$(command -v node)"
+SHORTCUT="${VD_SHORTCUT:-Ctrl+Alt+Space}"
 
-echo "→ qovluqlar"
-mkdir -p "$SHARE" "$HOME/.local/bin" "$HOME/.config/systemd/user" \
-  "$HOME/.local/share/kwin/scripts" "$HOME/.local/share/dbus-1/services"
+for t in node npm pw-record wl-copy ydotool qdbus6 notify-send; do
+  command -v "$t" >/dev/null || { echo "XƏTA: '$t' tapılmadı"; exit 1; }
+done
 
-echo "→ voice-dictate.js"
+echo "→ proqram: $SHARE"
+mkdir -p "$SHARE" "$BIN" "$UNITS" "$KWIN/contents/code" "$HOME/.local/share/dbus-1/services"
 cp "$REPO/src/voice-dictate.js" "$SHARE/"
 chmod +x "$SHARE/voice-dictate.js"
 
 echo "→ npm paketləri (ws, dbus-next)"
 cd "$SHARE"
 [ -f package.json ] || npm init -y >/dev/null
-npm install --omit=dev ws dbus-next
+npm install --silent --omit=dev ws dbus-next
+cd "$REPO"
 
-echo "→ CLI symlink"
-ln -sf "$SHARE/voice-dictate.js" "$HOME/.local/bin/voice-dictate"
+echo "→ CLI: $BIN/voice-dictate2"
+ln -sf "$SHARE/voice-dictate.js" "$BIN/voice-dictate2"
+cp "$REPO/systemd/voice-dictate2-hotkey-load.sh" "$BIN/"
+chmod +x "$BIN/voice-dictate2-hotkey-load.sh"
+
+subst() { sed "s|__NODE__|$NODE|g; s|__SHARE__|$SHARE|g; s|__BIN__|$BIN|g; s|__SHORTCUT__|$SHORTCUT|g" "$1"; }
 
 echo "→ systemd user servisləri"
-for f in "$REPO"/systemd/*.service; do
-  sed "s|/home/patriot|$HOME|g; s|ExecStart=.*voice-dictate.js listen|ExecStart=$NODE $SHARE/voice-dictate.js listen|" "$f" > "$HOME/.config/systemd/user/$(basename "$f")"
-done
+for f in "$REPO"/systemd/*.service; do subst "$f" > "$UNITS/$(basename "$f")"; done
 
-echo "→ KWin script"
-mkdir -p "$HOME/.local/share/kwin/scripts/voicedictate/contents/code"
-cp "$REPO/kwin/voicedictate/metadata.json" "$REPO/kwin/voicedictate/metadata.desktop" \
-   "$HOME/.local/share/kwin/scripts/voicedictate/"
-cp "$REPO/kwin/voicedictate/contents/code/main.js" \
-   "$HOME/.local/share/kwin/scripts/voicedictate/contents/code/"
-
-echo "→ hotkey loader skripti"
-cat > "$HOME/.local/bin/voice-dictate-hotkey-load.sh" <<EOF
-#!/bin/sh
-LOG="\$HOME/.cache/voice-dictate-hotkey.log"
-: > "\$LOG"
-i=0
-while [ \$i -lt 90 ]; do
-  if qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.isScriptLoaded voicedictate 2>>"\$LOG" | grep -q true; then
-    echo "\$(date '+%T') yüklendi, start() (cəhd \$i)" >> "\$LOG"
-    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start >>"\$LOG" 2>&1
-    exit 0
-  fi
-  echo "\$(date '+%T') yüklənir... (cəhd \$i)" >> "\$LOG"
-  qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript \
-    "$HOME/.local/share/kwin/scripts/voicedictate/contents/code/main.js" voicedictate >>"\$LOG" 2>&1
-  i=\$((i+1))
-  sleep 2
-done
-exit 1
-EOF
-chmod +x "$HOME/.local/bin/voice-dictate-hotkey-load.sh"
+echo "→ KWin script (qısayol: $SHORTCUT)"
+cp "$REPO/kwin/voicedictate2/metadata.json" "$REPO/kwin/voicedictate2/metadata.desktop" "$KWIN/"
+subst "$REPO/kwin/voicedictate2/contents/code/main.js" > "$KWIN/contents/code/main.js"
 
 echo "→ DBus aktivasiya"
-sed "s|/home/patriot|$HOME|g; s|Exec=.*voice-dictate.js|Exec=$NODE $SHARE/voice-dictate.js|" \
-  "$REPO/dbus/org.local.VoiceDictate.service" > "$HOME/.local/share/dbus-1/services/org.local.VoiceDictate.service"
+subst "$REPO/dbus/org.local.VoiceDictate2.service" > "$HOME/.local/share/dbus-1/services/org.local.VoiceDictate2.service"
 
-echo "→ dil konfiqi (ilk dəfə)"
-[ -f "$HOME/.config/voice-dictate.json" ] || echo '{"language":"tr"}' > "$HOME/.config/voice-dictate.json"
+echo "→ konfiq (yoxdursa)"
+[ -f "$HOME/.config/voice-dictate2.json" ] || cat > "$HOME/.config/voice-dictate2.json" <<'EOF'
+{
+  "language": "tr",
+  "silenceStopMs": 15000,
+  "maxRecordMs": 120000,
+  "silenceRms": 400,
+  "tray": true,
+  "clientVersion": ""
+}
+EOF
 
-echo "→ systemd enable"
+echo "→ systemd enable + start"
 systemctl --user daemon-reload
-systemctl --user enable --now voice-dictate
-systemctl --user enable --now voice-dictate-hotkey
+systemctl --user enable voice-dictate2 voice-dictate2-hotkey
+systemctl --user restart voice-dictate2
+systemctl --user restart voice-dictate2-hotkey || true
 
 echo
-echo "Bitti. Ctrl+Space ilə danış, yenidən bas — mətn kursora düşəcək."
-echo "Test: voice-dictate test 10"
+echo "Bitti. $SHORTCUT → danış → $SHORTCUT. Tray-də mikrofon ikonu görünməlidir."
+echo "Test: voice-dictate2 test 10    Protokol yoxlaması: voice-dictate2 check-endpoint"

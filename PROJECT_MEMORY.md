@@ -106,11 +106,11 @@ Ctrl+Space (fiziki)
 
 ## 7. Nə QALIB (gələcək ideyalar)
 
-- ⬜ `wtype` quraşdırmaq (daha təmiz paste; `sudo pacman -S wtype` — userdən soruş) — hazırda ydotool işləyir, vacib deyil
-- ⬜ Səssizlik avto-dayandırma (15s), 2 dəq limit — server özü bağlayır, client həll etmir
-- ⬜ System tray göstəricisi / recording pəncərəsi
-- ⬜ Claude Code update olarsa endpoint dəyişə bilər → yenidən `grep -aob "speech_to_text"` ilə yoxla (bu README-dəki protokol bölməsi kömək edər)
-- ⬜ Qısayolu dəyişmək istəsə: Shortcuts-də "Voice Dictate Toggle" (KWin script qeydiyyatı) və ya main.js-də keySequence
+- ➖ (lazım deyil — Ctrl+V paste Unicode-u həll edir) `wtype` quraşdırmaq (daha təmiz paste; `sudo pacman -S wtype` — userdən soruş) — hazırda ydotool işləyir, vacib deyil
+- ✅ (v2) Səssizlik avto-dayandırma (silenceStopMs) + maxRecordMs
+- ✅ (v2) System tray ikonu (StatusNotifierItem, dbus-next)
+- ✅ (v2) `voice-dictate2 check-endpoint` avtomatik yoxlayır. Claude Code update olarsa endpoint dəyişə bilər → yenidən `grep -aob "speech_to_text"` ilə yoxla (bu README-dəki protokol bölməsi kömək edər)
+- ✅ (v2) `VD_SHORTCUT=... ./install.sh`. Qısayolu dəyişmək istəsə: Shortcuts-də "Voice Dictate Toggle" (KWin script qeydiyyatı) və ya main.js-də keySequence
 - ⬜ **Qeyri-rəsmi istifadədir** — Anthropic ToS riski istifadəçiyə məxsusdur, şəxsi istifadə üçün
 
 ## 8. Test əmrləri
