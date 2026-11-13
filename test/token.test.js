@@ -9,7 +9,7 @@ function sandbox(bundleOk = true) {
   fs.mkdirSync(path.join(home, '.claude')); fs.mkdirSync(path.join(home, '.cache'));
   const vdir = path.join(home, '.local/share/claude/versions'); fs.mkdirSync(vdir, { recursive: true });
   fs.writeFileSync(path.join(vdir, '9.9.9'), bundleOk
-    ? 'xx .oauth_refresh.lock stale:60000,update:5000 claudeAiOauth grant_type:"refresh_token" xx' : 'nothing');
+    ? 'xx .oauth_refresh.lock stale:60000,update:5000 claudeAiOauth grant_type:"refresh_token" platform.claude.com/v1/oauth/token 9d1c250a-e61b-44d9-88ed-5944d1962f5e xx' : 'nothing');
   return home;
 }
 function load(home) {

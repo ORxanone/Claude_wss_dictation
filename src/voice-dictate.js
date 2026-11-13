@@ -142,25 +142,53 @@ function expOf(oauth) {
     : (Date.parse(oauth.expiresAt) || 0);
 }
 
-// Claude Code bundle-ında kilid protokolunun hələ də eyni olduğunu yoxla (versiya üzrə keşlənir)
-function ccLockProtocolOk() {
-  const v = latestClaudeVersion();
-  if (!v) return false;
+// ---------- Claude Code bundle protokol yoxlaması ----------
+// Claude Code yenilənəndə bundle-da bizim asılı olduğumuz sətirlərin hələ də olduğunu yoxlayır.
+// group 'stt' = diktə protokolu, 'lock' = token yeniləmə/kilid protokolu.
+const PROTOCOL_CHECKS = [
+  ['stt', 'WS endpoint yolu', '/api/ws/speech_to_text/voice_stream'],
+  ['stt', 'param endpointing_ms', 'endpointing_ms'],
+  ['stt', 'param utterance_end_ms', 'utterance_end_ms'],
+  ['stt', 'param use_conversation_engine', 'use_conversation_engine'],
+  ['stt', 'mesaj KeepAlive', '{"type":"KeepAlive"}'],
+  ['stt', 'mesaj CloseStream', '{"type":"CloseStream"}'],
+  ['stt', 'mesaj TranscriptText', 'TranscriptText'],
+  ['stt', 'mesaj TranscriptInterim', 'TranscriptInterim'],
+  ['stt', 'mesaj TranscriptEndpoint', 'TranscriptEndpoint'],
+  ['lock', 'OAuth token URL', 'platform.claude.com/v1/oauth/token'],
+  ['lock', 'OAuth client_id', OAUTH_CLIENT_ID],
+  ['lock', 'refresh grant', 'grant_type:"refresh_token"'],
+  ['lock', 'credentials açarı', 'claudeAiOauth'],
+  ['lock', 'Claude Code token kilidi', '.oauth_refresh.lock'],
+  ['lock', 'kilid parametrləri', 'stale:60000,update:5000'],
+];
+
+// Nəticə: { version, ok, missing:[[group,label,needle]...] } və ya null (bundle yoxdur).
+// Versiya+ölçü+mtime üzrə keşlənir — 342MB fayl hər versiya üçün yalnız bir dəfə oxunur.
+function protocolCheck(version, { force = false } = {}) {
+  const v = version || latestClaudeVersion();
+  if (!v) return null;
   const file = path.join(CLAUDE_VERSIONS, v);
-  let st; try { st = fs.statSync(file); } catch { return false; }
+  let st; try { st = fs.statSync(file); } catch { return null; }
   const key = `${v}:${st.size}:${st.mtimeMs}`;
-  try {
-    const c = JSON.parse(fs.readFileSync(LOCKCHECK_CACHE, 'utf8'));
-    if (c.key === key) return c.ok;
-  } catch {}
-  let ok = false;
-  try {
-    const buf = fs.readFileSync(file);
-    ok = ['.oauth_refresh.lock', 'stale:60000,update:5000', 'claudeAiOauth',
-      'grant_type:"refresh_token"'].every((n) => buf.indexOf(n) !== -1);
-  } catch {}
-  try { fs.writeFileSync(LOCKCHECK_CACHE, JSON.stringify({ key, ok })); } catch {}
-  return ok;
+  let cache = {};
+  try { cache = JSON.parse(fs.readFileSync(LOCKCHECK_CACHE, 'utf8')); } catch {}
+  if (!force && cache.results && cache.results[key]) return cache.results[key];
+  let buf; try { buf = fs.readFileSync(file); } catch { return null; }
+  const missing = PROTOCOL_CHECKS.filter(([, , n]) => buf.indexOf(n) === -1);
+  const i = buf.indexOf('speech_to_text');
+  const context = i === -1 ? '' : buf.subarray(Math.max(0, i - 120), i + 200)
+    .toString('latin1').replace(/[^\x20-\x7e]/g, '.');
+  buf = null;
+  const res = { version: v, ok: missing.length === 0, missing, context };
+  cache.results = { [key]: res }; // yalnız son versiyanı saxla
+  try { fs.writeFileSync(LOCKCHECK_CACHE, JSON.stringify(cache)); } catch {}
+  return res;
+}
+
+function ccLockProtocolOk() {
+  const r = protocolCheck();
+  return !!r && !r.missing.some(([g]) => g === 'lock');
 }
 
 function ccLockPaths() {
@@ -587,7 +615,15 @@ function childMain() {
     notify('🎙️ ' + text.slice(0, 60), body + reason, how === false);
   }).catch((e) => {
     clearState();
-    notify('🎙️ Xəta', String(e.message || e), true);
+    let msg = String(e.message || e);
+    // server/protokol xətası → Claude Code yenilənib protokol dəyişmiş ola bilər
+    if (/WS rədd|HTTP 4\d\d|HTTP 5\d\d|gözlənilmədən bağlandı|transkripsiya xətası|server xətası/.test(msg)) {
+      const r = protocolCheck();
+      msg += r && !r.ok
+        ? `\n⚠️ Claude Code ${r.version}-də protokol dəyişib — voice-dictate2 check-endpoint`
+        : '\nYoxla: voice-dictate2 check-endpoint';
+    }
+    notify('🎙️ Xəta', msg, true);
   });
 }
 
@@ -657,44 +693,49 @@ async function parentMain(cmd, args) {
   }
 }
 
-// ---------- check-endpoint ----------
-// Claude Code yenilənəndə bundle-da protokol sətirlərinin hələ də olduğunu yoxlayır.
+// ---------- check-endpoint (CLI) ----------
 function checkEndpoint(version) {
-  const v = version || latestClaudeVersion();
-  if (!v) { console.error('Claude Code versiyası tapılmadı: ' + CLAUDE_VERSIONS); return 2; }
-  const file = path.join(CLAUDE_VERSIONS, v);
-  console.log(`Bundle: ${file}` + (v === KNOWN_GOOD_VERSION ? ' (yoxlanılmış versiya)' : ` (yoxlanılmış: ${KNOWN_GOOD_VERSION})`));
-  let buf;
-  try { buf = fs.readFileSync(file); } catch (e) { console.error('oxunmadı: ' + e.message); return 2; }
-  const checks = [
-    ['WS endpoint yolu', '/api/ws/speech_to_text/voice_stream'],
-    ['OAuth token URL', 'platform.claude.com/v1/oauth/token'],
-    ['OAuth client_id', OAUTH_CLIENT_ID],
-    ['param endpointing_ms', 'endpointing_ms'],
-    ['param utterance_end_ms', 'utterance_end_ms'],
-    ['param use_conversation_engine', 'use_conversation_engine'],
-    ['Claude Code token kilidi', '.oauth_refresh.lock'],
-    ['kilid parametrləri', 'stale:60000,update:5000'],
-    ['mesaj KeepAlive', 'KeepAlive'],
-    ['mesaj CloseStream', 'CloseStream'],
-    ['mesaj TranscriptText', 'TranscriptText'],
-    ['mesaj TranscriptInterim', 'TranscriptInterim'],
-    ['mesaj TranscriptEndpoint', 'TranscriptEndpoint'],
-  ];
-  let bad = 0;
-  for (const [label, needle] of checks) {
-    const ok = buf.indexOf(needle) !== -1;
-    if (!ok) bad++;
-    console.log(`${ok ? '✅' : '❌'} ${label.padEnd(30)} ${needle}`);
+  const r = protocolCheck(version, { force: true });
+  if (!r) { console.error('Claude Code bundle tapılmadı: ' + CLAUDE_VERSIONS); return 2; }
+  console.log(`Claude Code ${r.version}` + (r.version === KNOWN_GOOD_VERSION
+    ? ' (yoxlanılmış versiya)' : ` (son yoxlanılmış: ${KNOWN_GOOD_VERSION})`));
+  for (const [g, label, needle] of PROTOCOL_CHECKS) {
+    const bad = r.missing.some(([, l]) => l === label);
+    console.log(`${bad ? '❌' : '✅'} [${g}] ${label.padEnd(30)} ${needle}`);
   }
-  // speech_to_text ətrafındakı kontekst (dəyişiklik varsa əl ilə baxmaq üçün)
-  const i = buf.indexOf('speech_to_text');
-  if (i !== -1) {
-    const ctx = buf.subarray(Math.max(0, i - 120), i + 200).toString('latin1').replace(/[^\x20-\x7e]/g, '.');
-    console.log('\nKontekst:\n' + ctx);
-  }
-  console.log(bad ? `\n⚠️  ${bad} sətir tapılmadı — protokol dəyişmiş ola bilər.` : '\nHər şey yerindədir.');
-  return bad ? 1 : 0;
+  if (r.context) console.log('\nKontekst (speech_to_text):\n' + r.context);
+  console.log(r.ok ? '\nHər şey yerindədir.' : `\n⚠️  ${r.missing.length} sətir tapılmadı — protokol dəyişmiş ola bilər.\n` +
+    '   Həll: PROJECT_MEMORY §2 / §3a-ya bax, bundle-da `grep -aob "speech_to_text"` ilə yeni dəyərləri tap.');
+  return r.ok ? 0 : 1;
+}
+
+// Daemon: yeni Claude Code versiyası gələndə avtomatik yoxla və bildir (versiya başına bir dəfə)
+const NOTIFIED_PATH = path.join(HOME, '.cache', APP + '.notified-version');
+function watchClaudeUpdates() {
+  const run = () => {
+    const v = latestClaudeVersion();
+    if (!v) return;
+    let last = ''; try { last = fs.readFileSync(NOTIFIED_PATH, 'utf8').trim(); } catch {}
+    if (last === v) return;
+    const r = protocolCheck(v);
+    if (!r) return;
+    if (r.ok) {
+      if (last) notify(`🎙️ Claude Code ${v} yoxlandı ✅`, 'diktə protokolu dəyişməyib');
+      log(`Claude Code ${v}: protokol OK`);
+    } else {
+      const stt = r.missing.filter(([g]) => g === 'stt').map(([, l]) => l);
+      const lock = r.missing.filter(([g]) => g === 'lock').map(([, l]) => l);
+      notify(`⚠️ Claude Code ${v}: protokol dəyişib`,
+        (stt.length ? `Diktə işləməyə bilər (${stt.join(', ')}). ` : '') +
+        (lock.length ? 'Token avto-yeniləmə təhlükəsizlik üçün söndürüldü. ' : '') +
+        'Ətraflı: voice-dictate2 check-endpoint', true);
+      log(`Claude Code ${v}: çatışmır → ${r.missing.map(([, l]) => l).join(', ')}`);
+    }
+    try { fs.writeFileSync(NOTIFIED_PATH, v); } catch {}
+  };
+  setTimeout(run, 15000);                 // login-dən bir az sonra
+  setInterval(run, 30 * 60 * 1000);       // hər 30 dəq
+  try { fs.watch(CLAUDE_VERSIONS, () => setTimeout(run, 60000)); } catch {} // yeni versiya yazılanda
 }
 
 // ---------- daemon: DBus + tray ----------
@@ -719,6 +760,7 @@ function listenMain() {
     bus.export(DBUS_PATH, new VoiceDictateIface());
     log('DBus dinləyici hazır (' + DBUS_NAME + ')');
     if (cfg().tray) startTray(bus, dbus).catch((e) => log('tray xətası: ' + e.message));
+    watchClaudeUpdates();
   }).catch((e) => {
     console.error('DBus:', e.message);
     process.exit(1);
